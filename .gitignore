@@ -1,0 +1,7 @@
+venv
+env
+.env
+__pycache__
+/database/schema.sql
+/tests
+schema.sql
