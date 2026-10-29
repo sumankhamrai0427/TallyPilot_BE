@@ -1,157 +1,144 @@
-# TallyPilot AI — Intelligent Accounting Automation Agent
+# 🌐 TallyPilot: Intelligent Bank Statement & Accounting Automation Platform
 
-TallyPilot AI is an enterprise-grade Proof of Concept (POC) designed to automate bank statement ingestion, transaction categorization using local LLMs (Ollama) with deterministic rule-based fallbacks, human clarification workflows, and double-entry voucher synchronization with **Tally Prime** via XML-over-HTTP.
+![Python](https://img.shields.io/badge/Python-3.11+-3776AB?style=flat&logo=python&logoColor=white)
+![Flask](https://img.shields.io/badge/Flask-3.0+-000000?style=flat&logo=flask&logoColor=white)
+![React](https://img.shields.io/badge/React-18-61DAFB?style=flat&logo=react&logoColor=black)
+![MySQL](https://img.shields.io/badge/MySQL-8.0+-4479A1?style=flat&logo=mysql&logoColor=white)
+![Tally Prime](https://img.shields.io/badge/Tally_Prime-XML_HTTP-00529B?style=flat)
+![License](https://img.shields.io/badge/License-MIT-green?style=flat)
+
+An enterprise-grade accounting automation platform designed to ingest bank statements (Excel / CSV), categorize transactions using intelligent accounting rules and local LLMs (Ollama), manage human clarification workflows for ambiguous entries, and synchronize verified double-entry accounting vouchers directly with **Tally Prime** via XML-over-HTTP.
 
 ---
 
-## 🏗 Architecture Overview
+## 🛠️ Tech Stack & Key Technologies
 
-Following the clean layered architecture pattern (controllers, services, repositories, models):
+- **Frontend:** Premium single-page application built with **React 18**, **TypeScript**, **Vite**, **Tailwind CSS**, **Recharts**, and **Lucide React** icons.
+- **Backend Server:** **Flask (Python)** with **SQLAlchemy (MySQL)**, scoped session lifecycle hooks, and structured REST endpoints.
+- **Accounting Engine:** Double-entry ledger validator ensuring debits equal credits, correct voucher typing (*Payment*, *Receipt*, *Contra*, *Journal*), and balance tracking.
+- **Categorization Engine:** Contextual categorization using local LLMs (*Mistral via Ollama*) paired with a deterministic rule fallback engine for 100% offline reliability.
+- **Tally Integration:** Synchronous XML HTTP client communicating directly with Tally Prime's local server (Port 9000), equipped with a realistic simulation mode for offline testing.
+- **Audit & Compliance:** Durable tracking records, SHA-256 payload hashing for idempotency, and full chronological audit logging.
 
-```text
-TallyPilot/
-├── backend/
-│   ├── app/
-│   │   ├── main.py                  # FastAPI application entrypoint
-│   │   ├── core/                    # Security, hashing & settings
-│   │   ├── api/                     # Controllers & REST endpoints
-│   │   ├── database/                # SQLAlchemy session & Base
-│   │   ├── models/                  # SQLAlchemy ORM models
-│   │   ├── schemas/                 # Strict Pydantic schemas
-│   │   ├── repositories/            # Data-access layer
-│   │   ├── services/                # Ingestion, LLM, Validator, Voucher builder, Tally client
-│   │   └── workers/                 # Folder watcher (watchdog)
-│   ├── tests/                       # Pytest automated test suite
-│   ├── init_db.py                   # Python DB initialization script
-│   └── requirements.txt
-├── frontend/                        # React + Vite + TypeScript + Tailwind CSS
-│   ├── src/
-│   │   ├── components/              # Navbar, Sidebar, UI cards
-│   │   ├── pages/                   # Dashboard, Import, Queue, Approvals, Tally, Logs, Settings
-│   │   ├── services/api.ts          # Axios client connecting to /api
-│   │   └── types/                   # TypeScript interfaces
-├── scripts/
-│   ├── schema_mysql.sql             # Full DDL Script for database: tallyprime
-│   └── generate_sample_excel.py     # Synthetic bank statement generator
-├── input/                           # Watcher folder for Excel statements (.xlsx, .xls)
-├── processed/                       # Successfully processed statements archive
-├── rejected/                        # Invalid / rejected statements
-├── run_backend.bat                  # One-click backend startup script
-├── run_frontend.bat                 # One-click frontend startup script
-├── run_watcher.bat                  # One-click folder watcher startup script
-└── .env.example                     # Environment configuration template
+---
+
+## 💎 Features
+
+- **Multi-Format Statement Ingestion:** Parses bank statements from `.xlsx`, `.xls`, and `.csv` formats with automatic column normalization and SHA-256 duplicate file detection.
+- **Intelligent Transaction Categorization:** Automatically maps narrations to Tally master ledgers (*Indirect Expenses*, *Sundry Creditors*, *Sundry Debtors*, *Bank Accounts*) with confidence scoring.
+- **Human-in-the-Loop Clarification Queue:** Flags low-confidence or ambiguous entries (e.g., unknown UPI transfers), allowing finance teams to select correct ledgers with one click.
+- **Double-Entry Balance & Approval Queue:** Verifies accounting balance and enables authorized users to review and approve vouchers individually or via batch authorization.
+- **Direct Tally Prime XML HTTP Integration:** Builds Tally-compliant XML envelopes and posts them directly to Tally Prime, capturing generated GUIDs into database logs.
+- **Simulation & Mock Mode:** Enables development and testing without requiring a live Tally Prime instance by generating realistic GUID responses.
+- **Complete Audit Trail & CSV Export:** Chronologically records all ingestion, clarification, approval, and posting events with instant CSV export capabilities.
+- **Adaptive Appearance:** Supports seamless Dark Mode and Light Mode with real-time KPI metrics and status distribution charts.
+
+---
+
+## 📐 Project Architecture
+
+```mermaid
+flowchart TD
+    A[Bank Statement .xlsx / .csv] --> B[File Ingestion & Parsing]
+    B --> C[Duplicate Check SHA-256]
+    C --> D[Categorization Engine]
+    D -->|High Confidence >= 80%| E[Accounting Balance Validator]
+    D -->|Low Confidence / Ambiguous| F[Human Clarification Queue]
+    F -->|User Selects Ledger| E
+    E --> G[Pending Approval Queue]
+    G -->|Authorized Approval| H[Tally XML Voucher Builder]
+    H --> I[Tally Prime HTTP Server :9000]
+    I --> J[Tally Day Book / Vouchers Created]
+    I -.->|Simulation Mode Active| K[Realistic Mock GUID Response]
 ```
 
 ---
 
-## 🗄️ Database Setup (MySQL — `tallyprime`)
+## 🚀 Setup & Installation
 
-The user requested manual management for database queries. The complete DDL script is located at:
-`scripts/schema_mysql.sql`
-
-### Option A: Run manually via MySQL CLI
-```bash
-mysql -u root -p < scripts/schema_mysql.sql
+### 1. Clone the Repository
+```cmd
+git clone https://github.com/your-username/TallyPilot_BE.git
+cd TallyPilot_BE
 ```
 
-### Option B: Run via MySQL Workbench / DBeaver / Navicat
-1. Open MySQL Workbench.
-2. Open file: `scripts/schema_mysql.sql`.
-3. Execute the script. It will create database `tallyprime` and all 10 tables:
-   - `import_batches`
-   - `bank_transactions`
-   - `transaction_classifications`
-   - `human_reviews`
-   - `approval_records`
-   - `tally_submissions`
-   - `tally_ledgers`
-   - `ledger_mappings`
-   - `audit_logs`
-   - `application_settings`
-
-### Option C: Run using Python init script
-```bash
-.venv\Scripts\python.exe backend/init_db.py
+### 2. Configure Virtual Environment
+```cmd
+python -m venv venv
+venv\Scripts\activate
 ```
 
----
+### 3. Install Dependencies
+```cmd
+pip install -r requirements.txt
+```
 
-## ⚙️ Environment Configuration (`.env`)
+### 4. Setup MySQL Database
+Open your MySQL client (Workbench, DBeaver, or CLI) and execute the schema file:
+```cmd
+mysql -u your_db_username -p < schema.sql
+```
+*(This creates the `TallyPilot` database along with all 10 tables and initial seed ledgers)*
 
-Create a `.env` file in the project root:
+### 5. Setup Environment Variables
+Configure `.env` in the backend directory:
 
 ```env
 # Application Settings
-APP_NAME="TallyPilot AI"
+APP_NAME=TallyPilot
 APP_ENV=development
-DEBUG=True
+APP_PORT=8000
+APP_HOST=0.0.0.0
 
-# MySQL Connection (database: tallyprime)
-DATABASE_URL=mysql+pymysql://root:YOUR_PASSWORD@localhost:3306/tallyprime
+# Database Settings
+DB_HOST=localhost
+DB_PORT=3306
+DB_NAME=TallyPilot
+DB_USER=your_db_username
+DB_PASSWORD=your_db_password
 
-# Local LLM / Ollama
-OLLAMA_BASE_URL=http://localhost:11434
-OLLAMA_MODEL=mistral
-AI_CONFIDENCE_THRESHOLD=0.80
-AI_FALLBACK_RULE_ENGINE=True
+# Database URL
+DATABASE_URL=mysql+pymysql://your_db_username:your_db_password@localhost:3306/TallyPilot?charset=utf8mb4
 
 # Tally Prime XML HTTP Configuration
-TALLY_HOST=localhost
-TALLY_PORT=9000
-TALLY_COMPANY=Demo Company
-TALLY_TIMEOUT=15
-TALLY_MOCK_MODE=True
+TALLY_URL=http://localhost:9000
+TALLY_COMPANY_NAME="Demo Company (FY 2026-27)"
+TALLY_TIMEOUT=10
+TALLY_SIMULATION_MODE=True
+
+# Categorization Thresholds
+AI_CONFIDENCE_THRESHOLD=0.80
+
+# CORS Allowed Origins
+CORS_ORIGINS=http://localhost:5173,http://127.0.0.1:5173
 ```
 
-*(Note: When Tally Prime is not running on port 9000, `TALLY_MOCK_MODE=True` provides realistic simulation with generated voucher IDs).*
+### 6. Start the Backend Application
+```cmd
+python app.py
+```
+*(API will be live at: `http://localhost:8000`)*
 
 ---
 
-## 🚀 Running the Application
+## 📁 Directory Structure
 
-### 1. Start the Backend (FastAPI)
-Double-click `run_backend.bat` or run in terminal:
-```powershell
-.venv\Scripts\python.exe backend\app\main.py
-```
-Backend API will be live at: **http://localhost:8000**
-API Documentation (Swagger): **http://localhost:8000/docs**
-
-### 2. Start the Frontend (React + Vite)
-Double-click `run_frontend.bat` or run:
-```powershell
-cd frontend
-npm run dev
-```
-Frontend Dashboard will be live at: **http://localhost:5173**
-
-### 3. (Optional) Start Background Folder Watcher
-```powershell
-.venv\Scripts\python.exe backend\app\workers\folder_watcher.py
+```text
+├── controller/             # Flask request controllers (Dashboard, Files, Transactions, Tally, Logs, Settings)
+├── database/               # SQLAlchemy connection, session pooling, and repository abstraction
+├── helper/                 # Business services (Excel reader, accounting validator, voucher builder, Tally client)
+├── model/                  # SQLAlchemy ORM database models and Pydantic validation schemas
+├── tests/                  # Pytest automated test suite
+├── utils/                  # Centralized configuration, logger, and security hashing
+├── app.py                  # Main application runner and explicit route definitions
+├── init_db.py              # Database initialization and seed script
+├── schema.sql              # MySQL DDL table schema script
+├── requirements.txt        # Python backend dependencies
+└── README.md               # Project documentation
 ```
 
 ---
 
-## 🧪 Automated Test Suite
+## 📝 License
 
-Run unit and integration tests:
-```powershell
-cmd.exe /c .venv\Scripts\pytest.exe backend\tests
-```
-8 tests covering Excel ingestion, accounting validation, voucher XML building, and fallback classification pass automatically.
-
----
-
-## 📋 End-to-End Demonstration Workflow
-
-1. **Generate Sample Data**:
-   A sample statement is already ready at `./input/sample_bank_statement.xlsx` (or run `python scripts/generate_sample_excel.py`).
-2. **Import Statement**:
-   Open **http://localhost:5173**, navigate to **Import Statements**, and upload `./input/sample_bank_statement.xlsx`.
-3. **Clarification Queue**:
-   Transactions with low AI confidence or unknown ledgers appear in **Clarification Queue**. Select a valid Tally ledger (e.g. *ABC Suppliers Ltd*) and click **Submit & Revalidate**.
-4. **Approval Queue**:
-   Review proposed double-entry voucher balance (Debit vs Credit). Click **Post to Tally** (or batch authorize).
-5. **Audit Logs & Tally Page**:
-   Inspect generated GUIDs, XML payloads, and export audit logs to CSV.
-
+Distributed under the MIT License. See `LICENSE` for more information.
