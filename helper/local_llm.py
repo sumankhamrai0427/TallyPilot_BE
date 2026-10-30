@@ -9,37 +9,75 @@ from model.models import VoucherType
 
 class LocalLLMService:
     def __init__(self):
-        self.base_url = config.OLLAMA_URL.rstrip('/')
-        self.model = config.OLLAMA_MODEL
+        self.active_llm = config.ACTIVE_LLM
         self.confidence_threshold = config.AI_CONFIDENCE_THRESHOLD
 
+        # Mistral Cloud Configuration
+        self.mistral_api_key = config.MISTRAL_API_KEY
+        self.mistral_model = config.MISTRAL_MODEL
+        self.mistral_chat_url = config.MISTRAL_CHAT_URL
+
+        # Mistral Local / Self-Hosted Configuration
+        self.mistral_local_url = config.MISTRAL_LOCAL_URL.rstrip('/')
+        self.mistral_local_model = config.MISTRAL_LOCAL_MODEL
+        self.model = self.mistral_model if self.active_llm == "mistral_cloud" else self.mistral_local_model
+
     def check_health(self) -> Dict[str, Any]:
-        """Check if Ollama service is reachable and list models."""
+        """Check if configured LLM service (Mistral Cloud or Mistral Local) is reachable."""
+        if self.active_llm == "mistral_cloud":
+            if self.mistral_api_key:
+                return {
+                    "available": True,
+                    "status": "connected",
+                    "provider": "Mistral Cloud",
+                    "model": self.mistral_model,
+                    "endpoint": self.mistral_chat_url
+                }
+            return {
+                "available": False,
+                "status": "missing_api_key",
+                "provider": "Mistral Cloud",
+                "error": "MISTRAL_API_KEY not configured in .env",
+                "fallback_active": True
+            }
+
+        # Mistral Local / Ollama endpoint health check
         try:
-            with httpx.Client(timeout=3.0) as client:
-                res = client.get(f"{self.base_url}/api/tags")
+            with httpx.Client(timeout=0.5) as client:
+                res = client.get(f"{self.mistral_local_url}/api/tags")
                 if res.status_code == 200:
                     models = [m.get("name") for m in res.json().get("models", [])]
                     return {
                         "available": True,
                         "status": "connected",
-                        "endpoint": self.base_url,
-                        "configured_model": self.model,
+                        "provider": "Mistral Local",
+                        "endpoint": self.mistral_local_url,
+                        "configured_model": self.mistral_local_model,
                         "available_models": models
                     }
-        except Exception as e:
-            return {
-                "available": False,
-                "status": "disconnected",
-                "endpoint": self.base_url,
-                "error": str(e),
-                "configured_model": self.model,
-                "fallback_active": True
-            }
+        except Exception:
+            pass
+
+        # Try standard /v1/models check for vLLM / LiteLLM / OpenAI-compatible
+        try:
+            with httpx.Client(timeout=0.5) as client:
+                res = client.get(f"{self.mistral_local_url}/v1/models")
+                if res.status_code == 200:
+                    return {
+                        "available": True,
+                        "status": "connected",
+                        "provider": "Mistral Local (v1)",
+                        "endpoint": self.mistral_local_url,
+                        "configured_model": self.mistral_local_model
+                    }
+        except Exception:
+            pass
+
         return {
             "available": False,
-            "status": "unreachable",
-            "endpoint": self.base_url,
+            "status": "disconnected",
+            "provider": self.active_llm,
+            "endpoint": self.mistral_local_url,
             "fallback_active": True
         }
 
@@ -51,7 +89,7 @@ class LocalLLMService:
         available_ledgers: List[str]
     ) -> Tuple[AICorrectionProposal, bool]:
         """
-        Classifies transaction narration using Ollama LLM,
+        Classifies transaction narration using Mistral LLM (Cloud or Local),
         or gracefully falls back to deterministic rule-based engine.
         Returns: (AICorrectionProposal, is_fallback_rule)
         """
@@ -63,38 +101,83 @@ class LocalLLMService:
         prompt = self._build_prompt(narration, debit_amount, credit_amount, available_ledgers)
         
         try:
-            with httpx.Client(timeout=15.0) as client:
-                payload = {
-                    "model": self.model,
-                    "prompt": prompt,
-                    "format": "json",
-                    "stream": False,
-                    "options": {
-                        "temperature": 0.1
-                    }
+            # 1. Mistral Cloud API
+            if self.active_llm == "mistral_cloud" and self.mistral_api_key:
+                headers = {
+                    "Authorization": f"Bearer {self.mistral_api_key}",
+                    "Content-Type": "application/json"
                 }
-                res = client.post(f"{self.base_url}/api/generate", json=payload)
-                if res.status_code == 200:
-                    body = res.json()
-                    response_text = body.get("response", "{}")
-                    parsed_json = json.loads(response_text)
-                    
-                    proposal = AICorrectionProposal(**parsed_json)
-                    
-                    if proposal.suggested_ledger and proposal.suggested_ledger not in available_ledgers:
-                        closest = self._find_closest_ledger(proposal.suggested_ledger, available_ledgers)
-                        proposal.suggested_ledger = closest
-                        proposal.confidence = min(proposal.confidence, 0.70)
-                        proposal.requires_human_review = True
-                        proposal.ambiguity_reason = f"Original suggestion '{parsed_json.get('suggested_ledger')}' not in Tally ledgers. Closest match '{closest}' requires confirmation."
+                payload = {
+                    "model": self.mistral_model,
+                    "messages": [
+                        {"role": "system", "content": "You are a professional accounting classification engine. Respond with strict JSON only."},
+                        {"role": "user", "content": prompt}
+                    ],
+                    "response_format": {"type": "json_object"},
+                    "temperature": 0.1
+                }
+                with httpx.Client(timeout=15.0) as client:
+                    res = client.post(self.mistral_chat_url, json=payload, headers=headers)
+                    if res.status_code == 200:
+                        content = res.json()["choices"][0]["message"]["content"]
+                        parsed_json = json.loads(content)
+                        return self._process_llm_json(parsed_json, available_ledgers)
 
-                    return proposal, False
+            # 2. Mistral Local / OpenAI Compatible or Ollama endpoint
+            elif self.active_llm == "mistral_local":
+                # Try OpenAI-compatible chat completions first
+                chat_payload = {
+                    "model": self.mistral_local_model,
+                    "messages": [
+                        {"role": "system", "content": "You are a professional accounting classification engine. Respond with strict JSON only."},
+                        {"role": "user", "content": prompt}
+                    ],
+                    "temperature": 0.1
+                }
+                with httpx.Client(timeout=15.0) as client:
+                    for endpoint in [f"{self.mistral_local_url}/v1/chat/completions", f"{self.mistral_local_url}/chat/completions"]:
+                        try:
+                            res = client.post(endpoint, json=chat_payload)
+                            if res.status_code == 200:
+                                content = res.json()["choices"][0]["message"]["content"]
+                                parsed_json = json.loads(re.search(r'\{.*\}', content, re.DOTALL).group(0))
+                                return self._process_llm_json(parsed_json, available_ledgers)
+                        except Exception:
+                            continue
+
+                    # Fallback to Ollama /api/generate
+                    ollama_payload = {
+                        "model": self.mistral_local_model,
+                        "prompt": prompt,
+                        "format": "json",
+                        "stream": False,
+                        "options": {"temperature": 0.1}
+                    }
+                    try:
+                        res = client.post(f"{self.mistral_local_url}/api/generate", json=ollama_payload)
+                        if res.status_code == 200:
+                            body = res.json()
+                            parsed_json = json.loads(body.get("response", "{}"))
+                            return self._process_llm_json(parsed_json, available_ledgers)
+                    except Exception:
+                        pass
 
         except Exception:
             pass
 
         fallback = self._rule_based_fallback(narration, debit_amount, credit_amount, available_ledgers)
         return fallback, True
+
+    def _process_llm_json(self, parsed_json: Dict[str, Any], available_ledgers: List[str]) -> Tuple[AICorrectionProposal, bool]:
+        """Validates LLM JSON output and checks ledger availability."""
+        proposal = AICorrectionProposal(**parsed_json)
+        if proposal.suggested_ledger and proposal.suggested_ledger not in available_ledgers:
+            closest = self._find_closest_ledger(proposal.suggested_ledger, available_ledgers)
+            proposal.suggested_ledger = closest
+            proposal.confidence = min(proposal.confidence, 0.70)
+            proposal.requires_human_review = True
+            proposal.ambiguity_reason = f"Original suggestion '{parsed_json.get('suggested_ledger')}' not in Tally ledgers. Closest match '{closest}' requires confirmation."
+        return proposal, False
 
     def _build_prompt(self, narration: str, debit: float, credit: float, ledgers: List[str]) -> str:
         direction = f"Withdrawal/Debit: {debit}" if debit > 0 else f"Deposit/Credit: {credit}"

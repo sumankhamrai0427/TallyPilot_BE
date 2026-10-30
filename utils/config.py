@@ -39,9 +39,13 @@ class Config:
     TALLY_COMPANY_NAME: str = os.getenv("TALLY_COMPANY_NAME", "Demo Company (FY 2026-27)")
     TALLY_SIMULATION_MODE: bool = os.getenv("TALLY_SIMULATION_MODE", "True").lower() in ("true", "1", "yes")
 
-    # Local Ollama / Categorizer
-    OLLAMA_URL: str = os.getenv("OLLAMA_URL", "http://localhost:11434")
-    OLLAMA_MODEL: str = os.getenv("OLLAMA_MODEL", "mistral")
+    # LLM Configuration (Mistral Cloud, Mistral Local, or Ollama)
+    ACTIVE_LLM: str = os.getenv("ACTIVE_LLM", "mistral_local")
+    MISTRAL_API_KEY: str = os.getenv("MISTRAL_API_KEY", "")
+    MISTRAL_MODEL: str = os.getenv("MISTRAL_MODEL", "mistral-small-latest")
+    MISTRAL_CHAT_URL: str = os.getenv("MISTRAL_CHAT_URL", "https://api.mistral.ai/v1/chat/completions")
+    MISTRAL_LOCAL_URL: str = os.getenv("MISTRAL_LOCAL_URL", os.getenv("OLLAMA_URL", "http://122.163.121.176:3041"))
+    MISTRAL_LOCAL_MODEL: str = os.getenv("MISTRAL_LOCAL_MODEL", os.getenv("OLLAMA_MODEL", "mistral:latest"))
     AI_CONFIDENCE_THRESHOLD: float = float(os.getenv("AI_CONFIDENCE_THRESHOLD", "0.80"))
 
     # Folder Ingestion Paths

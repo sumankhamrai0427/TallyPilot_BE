@@ -39,6 +39,21 @@ def get_dashboard_summary():
             status_distribution=status_counts
         )
 
-        return jsonify(summary_data.model_dump())
+        return jsonify(summary_data.model_dump(mode="json"))
+    except Exception as e:
+        from utils.logger import logger
+        logger.error(f"Error generating dashboard summary: {e}")
+        return jsonify({
+            "total_transactions": 0,
+            "processed_transactions": 0,
+            "clarification_queue_count": 0,
+            "approval_queue_count": 0,
+            "failed_transactions": 0,
+            "skipped_transactions": 0,
+            "tally_connection_status": "offline",
+            "llm_connection_status": "fallback_active",
+            "recent_batches": [],
+            "status_distribution": {}
+        }), 200
     finally:
         db.close()

@@ -61,6 +61,19 @@ def create_app() -> Flask:
         response.headers["Referrer-Policy"] = "no-referrer"
         return response
 
+    # ------------------------------------------------------------
+    # Error Handlers
+    # ------------------------------------------------------------
+    @app.errorhandler(500)
+    def handle_500(err):
+        import traceback
+        logger.error(f"Internal Server Error: {err}\n{traceback.format_exc()}")
+        return jsonify({"detail": "Internal Server Error", "error": str(err)}), 500
+
+    @app.errorhandler(404)
+    def handle_404(err):
+        return jsonify({"detail": "Endpoint not found"}), 404
+
     # ============================================================
     # 1. Root Status Endpoint
     # ============================================================

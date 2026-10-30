@@ -122,7 +122,7 @@ class ImportBatchOut(BaseModel):
     parsed_rows: int
     failed_rows: int
     status: str
-    error_message: Optional[str]
+    error_message: Optional[str] = None
     created_at: datetime
 
     model_config = ConfigDict(from_attributes=True)
@@ -144,10 +144,10 @@ class AuditLogOut(BaseModel):
     timestamp: datetime
     actor: str
     action: str
-    batch_id: Optional[int]
-    transaction_id: Optional[int]
-    previous_status: Optional[str]
-    new_status: Optional[str]
+    batch_id: Optional[int] = None
+    transaction_id: Optional[int] = None
+    previous_status: Optional[str] = None
+    new_status: Optional[str] = None
     summary: str
     details: Optional[Dict[str, Any]] = None
 
@@ -156,14 +156,14 @@ class AuditLogOut(BaseModel):
 
 # Dashboard Summary Out
 class DashboardSummaryOut(BaseModel):
-    total_transactions: int
-    processed_transactions: int
-    clarification_queue_count: int
-    approval_queue_count: int
-    failed_transactions: int
-    skipped_transactions: int
-    tally_connection_status: str
-    llm_connection_status: str
-    recent_batches: List[ImportBatchOut]
-    status_distribution: Dict[str, int]
+    total_transactions: int = 0
+    processed_transactions: int = 0
+    clarification_queue_count: int = 0
+    approval_queue_count: int = 0
+    failed_transactions: int = 0
+    skipped_transactions: int = 0
+    tally_connection_status: str = "offline"
+    llm_connection_status: str = "fallback_active"
+    recent_batches: List[ImportBatchOut] = []
+    status_distribution: Dict[str, int] = {}
 
