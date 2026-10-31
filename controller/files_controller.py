@@ -13,39 +13,75 @@ from model.schemas import ImportBatchOut
 
 
 def upload_bank_statement():
-    """Uploads and ingests a bank statement file (.xlsx, .xls, .csv)."""
-    if "file" not in request.files:
-        return jsonify({"detail": "No file uploaded in form field 'file'"}), 400
+    """Uploads and ingests one or multiple bank statement files (.xlsx, .xls, .csv, .pdf, .txt)."""
+    # Collect files from 'files' or 'file' form fields
+    uploaded_files = request.files.getlist("files")
+    if not uploaded_files or (len(uploaded_files) == 1 and not uploaded_files[0].filename):
+        uploaded_files = request.files.getlist("file")
 
-    uploaded_file = request.files["file"]
-    if not uploaded_file.filename:
-        return jsonify({"detail": "Empty file name provided"}), 400
+    if not uploaded_files or not any(f.filename for f in uploaded_files):
+        return jsonify({"detail": "No files uploaded. Provide file(s) in form field 'files' or 'file'"}), 400
 
-    ext = os.path.splitext(uploaded_file.filename)[1].lower()
-    if ext not in [".xlsx", ".xls", ".csv"]:
-        return jsonify({"detail": "Invalid file format. Supported formats: .xlsx, .xls, .csv"}), 400
-
+    valid_extensions = [".xlsx", ".xls", ".csv", ".pdf", ".txt"]
     os.makedirs(config.INPUT_DIR, exist_ok=True)
-    destination_path = os.path.join(config.INPUT_DIR, uploaded_file.filename)
 
-    uploaded_file.save(destination_path)
+    successful_batches = []
+    failed_files = []
 
     db = SessionLocal()
     try:
         workflow = WorkflowService(db)
-        batch = workflow.ingest_excel_file(destination_path, uploaded_file.filename)
-        return jsonify(ImportBatchOut.model_validate(batch).model_dump()), 201
-    except ValueError as e:
-        return jsonify({"detail": str(e)}), 400
-    except Exception as e:
-        return jsonify({"detail": f"File processing error: {str(e)}"}), 500
+        for uploaded_file in uploaded_files:
+            if not uploaded_file.filename:
+                continue
+
+            filename = uploaded_file.filename
+            ext = os.path.splitext(filename)[1].lower()
+            if ext not in valid_extensions:
+                failed_files.append({
+                    "filename": filename,
+                    "error": f"Unsupported format '{ext}'. Supported: {', '.join(valid_extensions)}"
+                })
+                continue
+
+            destination_path = os.path.join(config.INPUT_DIR, filename)
+            try:
+                uploaded_file.save(destination_path)
+                batch = workflow.ingest_excel_file(destination_path, filename)
+                batch_dict = ImportBatchOut.model_validate(batch).model_dump(mode="json")
+                successful_batches.append(batch_dict)
+            except ValueError as ve:
+                failed_files.append({"filename": filename, "error": str(ve)})
+            except Exception as e:
+                failed_files.append({"filename": filename, "error": f"Processing error: {str(e)}"})
+
+        # Backward compatibility for single file upload
+        if len(uploaded_files) == 1 and len(successful_batches) == 1 and not failed_files:
+            single_res = successful_batches[0]
+            single_res["batches"] = successful_batches
+            return jsonify(single_res), 201
+
+        if not successful_batches and failed_files:
+            return jsonify({
+                "detail": failed_files[0]["error"],
+                "failed_files": failed_files
+            }), 400
+
+        return jsonify({
+            "batches": successful_batches,
+            "total_files": len(uploaded_files),
+            "successful_count": len(successful_batches),
+            "failed_files": failed_files
+        }), 201
+
     finally:
         db.close()
 
 
 def scan_input_folder():
-    """Scans the configured input directory for new statement files (.xlsx, .xls, .csv)."""
+    """Scans the configured input directory for new statement files (.xlsx, .xls, .csv, .pdf, .txt)."""
     os.makedirs(config.INPUT_DIR, exist_ok=True)
+    valid_exts = (".xlsx", ".xls", ".csv", ".pdf", ".txt")
     db = SessionLocal()
     try:
         workflow = WorkflowService(db)
@@ -53,13 +89,13 @@ def scan_input_folder():
 
         files = [
             f for f in os.listdir(config.INPUT_DIR)
-            if f.lower().endswith((".xlsx", ".xls", ".csv")) and not f.startswith("~$")
+            if f.lower().endswith(valid_exts) and not f.startswith("~$")
         ]
         for filename in files:
             full_path = os.path.join(config.INPUT_DIR, filename)
             try:
                 batch = workflow.ingest_excel_file(full_path, filename)
-                processed_batches.append(ImportBatchOut.model_validate(batch).model_dump())
+                processed_batches.append(ImportBatchOut.model_validate(batch).model_dump(mode="json"))
             except Exception:
                 continue
 

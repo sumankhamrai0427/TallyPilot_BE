@@ -28,8 +28,8 @@ class ExcelReaderService:
             raise ValueError(f"File size {file_size} exceeds maximum permitted limit {self.max_file_size_bytes} bytes")
 
         ext = os.path.splitext(file_path)[1].lower()
-        if ext not in [".xlsx", ".xls", ".csv"]:
-            raise ValueError(f"Unsupported file format '{ext}'. Supported formats: .xlsx, .xls, .csv")
+        if ext not in [".xlsx", ".xls", ".csv", ".pdf", ".txt"]:
+            raise ValueError(f"Unsupported file format '{ext}'. Supported formats: .xlsx, .xls, .csv, .pdf, .txt")
 
         with open(file_path, "rb") as f:
             content = f.read()
@@ -42,6 +42,10 @@ class ExcelReaderService:
         
         if ext == ".csv":
             return self._parse_csv(file_path)
+        elif ext == ".txt":
+            return self._parse_txt(file_path)
+        elif ext == ".pdf":
+            return self._parse_pdf(file_path)
         else:
             return self._parse_excel(file_path)
 
@@ -74,6 +78,145 @@ class ExcelReaderService:
         # Read with appropriate header row
         df = pd.read_excel(file_path, sheet_name=sheet_name, skiprows=header_row_index)
         return self._process_dataframe(df, header_row_index=header_row_index)
+
+    def _parse_txt(self, file_path: str) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        """Parses structured or line-based bank statement text files (.txt)."""
+        # Try reading as delimited text (Tab, Pipe, Comma, Semicolon)
+        for sep in ["\t", "|", ",", ";"]:
+            for encoding in ["utf-8", "latin1", "cp1252"]:
+                try:
+                    df_raw = pd.read_csv(file_path, sep=sep, header=None, encoding=encoding, on_bad_lines="skip")
+                    if df_raw.shape[1] >= 3:
+                        header_idx = self._find_header_row(df_raw)
+                        df = pd.read_csv(file_path, sep=sep, skiprows=header_idx, encoding=encoding, on_bad_lines="skip")
+                        if df.shape[1] >= 3:
+                            return self._process_dataframe(df, header_row_index=header_idx)
+                except Exception:
+                    continue
+
+        # Fallback to reading raw lines
+        lines = []
+        for encoding in ["utf-8", "latin1", "cp1252"]:
+            try:
+                with open(file_path, "r", encoding=encoding) as f:
+                    lines = [l.strip() for l in f.readlines() if l.strip()]
+                if lines:
+                    break
+            except Exception:
+                continue
+
+        if not lines:
+            raise ValueError("Could not parse text statement file or file is empty.")
+
+        return self._extract_rows_from_text_lines(lines)
+
+    def _parse_pdf(self, file_path: str) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        """Extracts and parses bank statement transactions from PDF files using pypdf."""
+        try:
+            import pypdf
+        except ImportError:
+            raise ValueError("pypdf is required to parse PDF bank statements. Please install pypdf.")
+
+        reader = pypdf.PdfReader(file_path)
+        extracted_lines = []
+        for page in reader.pages:
+            text = page.extract_text() or ""
+            for line in text.splitlines():
+                line_str = line.strip()
+                if line_str:
+                    extracted_lines.append(line_str)
+
+        if not extracted_lines:
+            raise ValueError("Could not extract any readable text from the uploaded PDF statement.")
+
+        return self._extract_rows_from_text_lines(extracted_lines)
+
+    def _extract_rows_from_text_lines(self, lines: List[str]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        """Heuristic extractor that parses transactions from text/PDF lines."""
+        date_pattern = re.compile(r'^(\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{4}[/-]\d{1,2}[/-]\d{1,2}|\d{1,2}-[A-Za-z]{3}-\d{2,4})')
+        number_pattern = re.compile(r'[-+]?\b\d{1,3}(?:,\d{3})*(?:\.\d{1,2})?\b|\b\d+(?:\.\d{1,2})?\b')
+
+        valid_transactions = []
+        parsing_errors = []
+
+        for idx, line in enumerate(lines):
+            # Check if line begins with a date
+            match = date_pattern.search(line)
+            if not match:
+                continue
+
+            date_str = match.group(1)
+            parsed_date = self._parse_date(date_str)
+            if not parsed_date:
+                continue
+
+            # Remainder of line after the date
+            rem_line = line[match.end():].strip()
+            if not rem_line:
+                continue
+
+            # Look for numeric amounts at the end of the line
+            numbers = number_pattern.findall(rem_line)
+            if not numbers:
+                continue
+
+            try:
+                # Typically last 1-3 numbers are debit/credit/balance
+                debit_val = Decimal("0.00")
+                credit_val = Decimal("0.00")
+                balance_val = None
+
+                clean_numbers = [self._parse_decimal(n) for n in numbers if n not in [".", ",", "-"]]
+                if not clean_numbers:
+                    continue
+
+                if len(clean_numbers) >= 3:
+                    debit_val = clean_numbers[-3]
+                    credit_val = clean_numbers[-2]
+                    balance_val = clean_numbers[-1]
+                    cutoff = rem_line.rfind(str(numbers[-3]))
+                    narration = rem_line[:cutoff].strip() if cutoff > 0 else rem_line
+                elif len(clean_numbers) == 2:
+                    debit_val = clean_numbers[-2]
+                    balance_val = clean_numbers[-1]
+                    cutoff = rem_line.rfind(str(numbers[-2]))
+                    narration = rem_line[:cutoff].strip() if cutoff > 0 else rem_line
+                else:
+                    debit_val = clean_numbers[-1]
+                    cutoff = rem_line.rfind(str(numbers[-1]))
+                    narration = rem_line[:cutoff].strip() if cutoff > 0 else rem_line
+
+                # Filter out pure digits at start of narration that might be ref numbers
+                narration = re.sub(r'^[|\t,; ]+', '', narration).strip()
+                if not narration:
+                    narration = f"Bank Transaction {parsed_date}"
+
+                # Ensure at least debit or credit has a non-zero value
+                if debit_val == Decimal("0.00") and credit_val == Decimal("0.00"):
+                    continue
+
+                valid_transactions.append({
+                    "source_row_index": idx + 1,
+                    "transaction_date": parsed_date,
+                    "value_date": parsed_date,
+                    "bank_reference": None,
+                    "narration": narration,
+                    "debit_amount": debit_val,
+                    "credit_amount": credit_val,
+                    "balance": balance_val,
+                    "raw_payload": {"raw_line": line}
+                })
+            except Exception as e:
+                parsing_errors.append({
+                    "row_index": idx + 1,
+                    "error": str(e),
+                    "raw_values": {"line": line}
+                })
+
+        if not valid_transactions:
+            raise ValueError("No valid transaction rows found in the provided statement text/PDF.")
+
+        return valid_transactions, parsing_errors
 
     def _process_dataframe(self, df: pd.DataFrame, header_row_index: int = 0) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         # Normalize column names
