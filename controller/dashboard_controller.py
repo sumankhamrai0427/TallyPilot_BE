@@ -13,18 +13,21 @@ def get_dashboard_summary():
     """Returns real-time KPI metrics, transaction counts, and connection states."""
     db = SessionLocal()
     try:
+        from helper.tenant import resolve_tenant_context
+        company_id, _ = resolve_tenant_context(db)
+
         tx_repo = TransactionRepository(db)
         batch_repo = BatchRepository(db)
         llm_service = LocalLLMService()
         tally_client = TallyClientService()
 
-        status_counts = tx_repo.count_by_status()
-        total_tx = tx_repo.total_count()
+        status_counts = tx_repo.count_by_status(company_id=company_id)
+        total_tx = tx_repo.total_count(company_id=company_id)
 
         llm_health = llm_service.check_health()
         tally_health = tally_client.test_connection()
 
-        recent_batches = batch_repo.list_recent(limit=5)
+        recent_batches = batch_repo.list_recent(company_id=company_id, limit=5)
 
         summary_data = DashboardSummaryOut(
             total_transactions=total_tx,

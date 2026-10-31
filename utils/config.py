@@ -22,29 +22,32 @@ class Config:
 
     # Database
     _raw_db_url = os.getenv("DATABASE_URL")
-    if not _raw_db_url and os.getenv("DB_USER") and os.getenv("DB_PASSWORD"):
+    if _raw_db_url:
+        DATABASE_URL: str = _raw_db_url
+    else:
         import urllib.parse
         _user = os.getenv("DB_USER", "root")
         _pass = urllib.parse.quote_plus(os.getenv("DB_PASSWORD", ""))
         _host = os.getenv("DB_HOST", "localhost")
         _port = os.getenv("DB_PORT", "3306")
-        _name = os.getenv("DB_NAME", "TallyPilot")
-        DATABASE_URL: str = f"mysql+pymysql://{_user}:{_pass}@{_host}:{_port}/{_name}?charset=utf8mb4"
-    else:
-        DATABASE_URL: str = _raw_db_url or "mysql+pymysql://root:root@localhost:3306/TallyPilot?charset=utf8mb4"
+        _name = os.getenv("DB_NAME", "TallyPilot_V2")
+        if _pass:
+            DATABASE_URL: str = f"mysql+pymysql://{_user}:{_pass}@{_host}:{_port}/{_name}?charset=utf8mb4"
+        else:
+            DATABASE_URL: str = f"mysql+pymysql://{_user}@{_host}:{_port}/{_name}?charset=utf8mb4"
 
     # Tally Prime XML HTTP Configuration
     TALLY_URL: str = os.getenv("TALLY_URL", "http://localhost:9000")
     TALLY_TIMEOUT: int = int(os.getenv("TALLY_TIMEOUT", "10"))
-    TALLY_COMPANY_NAME: str = os.getenv("TALLY_COMPANY_NAME", "Demo Company (FY 2026-27)")
+    TALLY_COMPANY_NAME: str = os.getenv("TALLY_COMPANY_NAME", "")
     TALLY_SIMULATION_MODE: bool = os.getenv("TALLY_SIMULATION_MODE", "True").lower() in ("true", "1", "yes")
 
-    # LLM Configuration (Mistral Cloud, Mistral Local, or Ollama)
+    # LLM Configuration (Mistral Cloud, Mistral Local, or Ollama) - strictly maintained in .env
     ACTIVE_LLM: str = os.getenv("ACTIVE_LLM", "mistral_local")
     MISTRAL_API_KEY: str = os.getenv("MISTRAL_API_KEY", "")
     MISTRAL_MODEL: str = os.getenv("MISTRAL_MODEL", "mistral-small-latest")
-    MISTRAL_CHAT_URL: str = os.getenv("MISTRAL_CHAT_URL", "https://api.mistral.ai/v1/chat/completions")
-    MISTRAL_LOCAL_URL: str = os.getenv("MISTRAL_LOCAL_URL", os.getenv("OLLAMA_URL", "http://122.163.121.176:3041"))
+    MISTRAL_CHAT_URL: str = os.getenv("MISTRAL_CHAT_URL", "")
+    MISTRAL_LOCAL_URL: str = os.getenv("MISTRAL_LOCAL_URL", os.getenv("OLLAMA_URL", ""))
     MISTRAL_LOCAL_MODEL: str = os.getenv("MISTRAL_LOCAL_MODEL", os.getenv("OLLAMA_MODEL", "mistral:latest"))
     AI_CONFIDENCE_THRESHOLD: float = float(os.getenv("AI_CONFIDENCE_THRESHOLD", "0.80"))
 

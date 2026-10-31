@@ -8,6 +8,11 @@ from controller import (
     tally_controller,
     logs_controller,
     settings_controller,
+    vouchers_controller,
+    ledgers_controller,
+    reconciliation_controller,
+    reports_controller,
+    assistant_controller,
 )
 
 __all__ = [
@@ -17,4 +22,9 @@ __all__ = [
     "tally_controller",
     "logs_controller",
     "settings_controller",
+    "vouchers_controller",
+    "ledgers_controller",
+    "reconciliation_controller",
+    "reports_controller",
+    "assistant_controller",
 ]

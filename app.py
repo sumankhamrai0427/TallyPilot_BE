@@ -20,6 +20,11 @@ from controller import (
     tally_controller,
     logs_controller,
     settings_controller,
+    vouchers_controller,
+    ledgers_controller,
+    reconciliation_controller,
+    reports_controller,
+    assistant_controller,
 )
 
 
@@ -208,6 +213,166 @@ def create_app() -> Flask:
     def api_settings_update():
         """Updates runtime application settings."""
         return settings_controller.update_settings()
+
+    # ============================================================
+    # 8. Multi-Tenant Companies & Ledgers Endpoints
+    # ============================================================
+    @app.route("/api/companies", methods=["GET"])
+    def api_companies_list():
+        """Lists active companies."""
+        return ledgers_controller.list_companies()
+
+    @app.route("/api/companies/<int:company_id>", methods=["GET"])
+    def api_company_get(company_id: int):
+        """Retrieves a single company profile with credentials."""
+        return ledgers_controller.get_company(company_id)
+
+    @app.route("/api/companies", methods=["POST"])
+    def api_company_create():
+        """Creates a new company master with credentials."""
+        return ledgers_controller.create_company()
+
+    @app.route("/api/companies/<int:company_id>", methods=["PUT"])
+    def api_company_update(company_id: int):
+        """Updates company details and credentials."""
+        return ledgers_controller.update_company(company_id)
+
+    @app.route("/api/companies/<int:company_id>/test-tally", methods=["POST"])
+    def api_company_test_tally(company_id: int):
+        """Tests live Tally Prime connection for a company."""
+        return ledgers_controller.test_company_tally(company_id)
+
+    @app.route("/api/financial-years", methods=["GET"])
+    def api_financial_years_list():
+        """Lists financial years for the active company."""
+        return ledgers_controller.list_financial_years()
+
+    @app.route("/api/financial-years", methods=["POST"])
+    def api_financial_year_create():
+        """Creates a new financial year."""
+        return ledgers_controller.create_financial_year()
+
+    @app.route("/api/financial-years/<int:fy_id>/set-current", methods=["PUT"])
+    def api_financial_year_set_current(fy_id: int):
+        """Sets active financial year."""
+        return ledgers_controller.set_current_financial_year(fy_id)
+
+    @app.route("/api/financial-years/<int:fy_id>/toggle-lock", methods=["PUT"])
+    def api_financial_year_toggle_lock(fy_id: int):
+        """Locks/unlocks financial year (closing control)."""
+        return ledgers_controller.toggle_financial_year_lock(fy_id)
+
+    @app.route("/api/chart-of-accounts", methods=["GET"])
+    def api_chart_of_accounts():
+        """Retrieves hierarchical Chart of Accounts tree."""
+        return ledgers_controller.get_chart_of_accounts()
+
+    @app.route("/api/ledgers", methods=["GET"])
+    def api_ledgers_list():
+        """Retrieves flat list of active ledger accounts."""
+        return ledgers_controller.list_ledgers()
+
+    @app.route("/api/parties", methods=["GET"])
+    def api_parties_list():
+        """Retrieves active parties for the company."""
+        return ledgers_controller.list_parties()
+
+    # ============================================================
+    # 9. Double-Entry Vouchers & General Ledger Endpoints
+    # ============================================================
+    @app.route("/api/vouchers", methods=["GET"])
+    def api_vouchers_list():
+        """Lists double-entry vouchers with filtering and pagination."""
+        return vouchers_controller.list_vouchers()
+
+    @app.route("/api/vouchers", methods=["POST"])
+    def api_vouchers_create():
+        """Creates a double-entry voucher with balanced lines."""
+        return vouchers_controller.create_voucher()
+
+    @app.route("/api/vouchers/<int:voucher_id>", methods=["GET"])
+    def api_vouchers_get(voucher_id: int):
+        """Retrieves full details of a voucher."""
+        return vouchers_controller.get_voucher(voucher_id)
+
+    @app.route("/api/vouchers/<int:voucher_id>/post", methods=["POST"])
+    def api_vouchers_post(voucher_id: int):
+        """Posts an approved voucher to the General Ledger."""
+        return vouchers_controller.post_voucher(voucher_id)
+
+    @app.route("/api/vouchers/generate-from-transaction/<int:tx_id>", methods=["POST"])
+    def api_vouchers_generate_from_tx(tx_id: int):
+        """Auto-generates balanced double-entry voucher from a bank transaction."""
+        return vouchers_controller.generate_voucher_from_transaction(tx_id)
+
+    @app.route("/api/gl-entries", methods=["GET"])
+    def api_gl_entries_list():
+        """Lists General Ledger postings with ledger/date filtering."""
+        return vouchers_controller.get_general_ledger_entries()
+
+    @app.route("/api/ledger-balances", methods=["GET"])
+    def api_ledger_balances():
+        """Returns running ledger balances."""
+        return vouchers_controller.get_ledger_balances()
+
+    # ============================================================
+    # 10. Bank Reconciliation Endpoints
+    # ============================================================
+    @app.route("/api/reconciliation/summary", methods=["GET"])
+    def api_recon_summary():
+        """Returns reconciliation KPIs and bank account balances."""
+        return reconciliation_controller.get_reconciliation_summary()
+
+    @app.route("/api/reconciliation/unmatched", methods=["GET"])
+    def api_recon_unmatched():
+        """Returns unreconciled bank transactions and open voucher lines."""
+        return reconciliation_controller.list_unmatched_items()
+
+    @app.route("/api/reconciliation/match", methods=["POST"])
+    def api_recon_match():
+        """Matches a bank transaction with a voucher line."""
+        return reconciliation_controller.match_transaction()
+
+    # ============================================================
+    # 11. Financial Reporting Endpoints (HLA Part 10)
+    # ============================================================
+    @app.route("/api/reports/day-book", methods=["GET"])
+    def api_reports_day_book():
+        """Returns filtered Day Book entries."""
+        return reports_controller.get_day_book()
+
+    @app.route("/api/reports/trial-balance", methods=["GET"])
+    def api_reports_trial_balance():
+        """Generates deterministic Trial Balance (Debit == Credit)."""
+        return reports_controller.get_trial_balance()
+
+    @app.route("/api/reports/profit-loss", methods=["GET"])
+    def api_reports_profit_loss():
+        """Generates Profit and Loss statement."""
+        return reports_controller.get_profit_and_loss()
+
+    @app.route("/api/reports/balance-sheet", methods=["GET"])
+    def api_reports_balance_sheet():
+        """Generates Balance Sheet (Assets = Liabilities + Equity)."""
+        return reports_controller.get_balance_sheet()
+
+    # ============================================================
+    # 12. AI Accounting Assistant Endpoints (HLA Part 9 & 12)
+    # ============================================================
+    @app.route("/api/assistant/sessions", methods=["GET"])
+    def api_assistant_sessions():
+        """Lists chat conversation sessions."""
+        return assistant_controller.get_chat_sessions()
+
+    @app.route("/api/assistant/history/<int:session_id>", methods=["GET"])
+    def api_assistant_history(session_id: int):
+        """Retrieves chat message history for a session."""
+        return assistant_controller.get_chat_history(session_id)
+
+    @app.route("/api/assistant/chat", methods=["POST"])
+    def api_assistant_chat():
+        """Processes conversational query and executes accounting tools."""
+        return assistant_controller.post_chat_message()
 
     # Initialize database tables on app startup
     try:

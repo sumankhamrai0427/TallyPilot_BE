@@ -338,3 +338,76 @@ Respond ONLY with a valid JSON object matching this schema:
                 if first_word in text:
                     return l
         return self._get_bank_ledger(ledgers)
+
+
+    def generate_response(self, prompt: str, system_prompt: Optional[str] = None) -> str:
+        """Generates conversational response using configured Local LLM or Mistral Cloud."""
+        sys_msg = system_prompt or "You are an expert accounting assistant for TallyPilot. Provide concise, professional financial guidance."
+
+        try:
+            # 1. Mistral Cloud API
+            if self.active_llm == "mistral_cloud" and self.mistral_api_key:
+                headers = {
+                    "Authorization": f"Bearer {self.mistral_api_key}",
+                    "Content-Type": "application/json"
+                }
+                payload = {
+                    "model": self.mistral_model,
+                    "messages": [
+                        {"role": "system", "content": sys_msg},
+                        {"role": "user", "content": prompt}
+                    ],
+                    "temperature": 0.2
+                }
+                with httpx.Client(timeout=20.0) as client:
+                    res = client.post(self.mistral_chat_url, json=payload, headers=headers)
+                    if res.status_code == 200:
+                        return res.json()["choices"][0]["message"]["content"]
+
+            # 2. Mistral Local / Ollama / OpenAI-compatible
+            elif self.active_llm == "mistral_local":
+                # Try OpenAI-compatible endpoint
+                chat_payload = {
+                    "model": self.mistral_local_model,
+                    "messages": [
+                        {"role": "system", "content": sys_msg},
+                        {"role": "user", "content": prompt}
+                    ],
+                    "temperature": 0.2
+                }
+                with httpx.Client(timeout=10.0) as client:
+                    for endpoint in [f"{self.mistral_local_url}/v1/chat/completions", f"{self.mistral_local_url}/chat/completions"]:
+                        try:
+                            res = client.post(endpoint, json=chat_payload)
+                            if res.status_code == 200:
+                                return res.json()["choices"][0]["message"]["content"]
+                        except Exception:
+                            continue
+
+                    # Try Ollama endpoint
+                    ollama_payload = {
+                        "model": self.mistral_local_model,
+                        "prompt": f"{sys_msg}\n\nUser: {prompt}\nAssistant:",
+                        "stream": False,
+                        "options": {"temperature": 0.2}
+                    }
+                    try:
+                        res = client.post(f"{self.mistral_local_url}/api/generate", json=ollama_payload)
+                        if res.status_code == 200:
+                            return res.json().get("response", "")
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        # Intelligent Fallback response
+        return (
+            f"I have received your inquiry: \"{prompt}\".\n\n"
+            f"As your Local AI Accounting Assistant, I can help you monitor financial periods, "
+            f"review Trial Balance, check profit & loss, verify vouchers, and inspect ledger balances.\n\n"
+            f"Try asking:\n"
+            f"• **'Trial balance status'** — to check if Total Debit equals Total Credit\n"
+            f"• **'Profit and loss summary'** — to review revenue vs expenses\n"
+            f"• **'Balance of HDFC Bank'** — to check ledger running balance\n"
+            f"• Or explore the **Financial Reports** and **Vouchers & Day Book** modules in the sidebar."
+        )

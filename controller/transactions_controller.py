@@ -34,9 +34,12 @@ def list_transactions():
 
     db = SessionLocal()
     try:
+        from helper.tenant import resolve_tenant_context
+        company_id, _ = resolve_tenant_context(db)
         repo = TransactionRepository(db)
         skip = (page - 1) * page_size
         items, total = repo.list_filtered(
+            company_id=company_id,
             batch_id=batch_id,
             status=status,
             search=search,
