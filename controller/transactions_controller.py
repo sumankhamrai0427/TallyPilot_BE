@@ -49,7 +49,7 @@ def list_transactions():
         )
 
         return jsonify({
-            "items": [BankTransactionOut.model_validate(t).model_dump() for t in items],
+            "items": [BankTransactionOut.model_validate(t).model_dump(mode="json") for t in items],
             "total": total,
             "page": page,
             "page_size": page_size,
@@ -67,7 +67,7 @@ def get_transaction(tx_id: int):
         tx = repo.get_by_id(tx_id)
         if not tx:
             return jsonify({"detail": "Transaction not found"}), 404
-        return jsonify(BankTransactionOut.model_validate(tx).model_dump())
+        return jsonify(BankTransactionOut.model_validate(tx).model_dump(mode="json"))
     finally:
         db.close()
 
@@ -159,7 +159,7 @@ def skip_transaction(tx_id: int):
     try:
         workflow = WorkflowService(db)
         tx = workflow.skip_transaction(tx_id, req.reason)
-        return jsonify(BankTransactionOut.model_validate(tx).model_dump())
+        return jsonify(BankTransactionOut.model_validate(tx).model_dump(mode="json"))
     except ValueError as e:
         return jsonify({"detail": str(e)}), 400
     except Exception as e:
@@ -174,10 +174,179 @@ def retry_transaction(tx_id: int):
     try:
         workflow = WorkflowService(db)
         tx = workflow.retry_transaction(tx_id)
-        return jsonify(BankTransactionOut.model_validate(tx).model_dump())
+        return jsonify(BankTransactionOut.model_validate(tx).model_dump(mode="json"))
     except ValueError as e:
         return jsonify({"detail": str(e)}), 400
     except Exception as e:
         return jsonify({"detail": f"Failed to retry transaction: {str(e)}"}), 500
+    finally:
+        db.close()
+
+
+def edit_transaction(tx_id: int):
+    """Edits a proposed voucher's date, ledger, voucher type, amounts, or narration."""
+    payload = request.get_json(silent=True) or {}
+    db = SessionLocal()
+    try:
+        repo = TransactionRepository(db)
+        tx = repo.get_by_id(tx_id)
+        if not tx:
+            return jsonify({"detail": "Transaction not found"}), 404
+
+        from datetime import date
+        from decimal import Decimal
+
+        if "transaction_date" in payload and payload["transaction_date"]:
+            tx.transaction_date = date.fromisoformat(payload["transaction_date"])
+        if "narration" in payload and payload["narration"]:
+            tx.narration = payload["narration"]
+        if "debit_amount" in payload:
+            tx.debit_amount = Decimal(str(payload["debit_amount"] or 0))
+        if "credit_amount" in payload:
+            tx.credit_amount = Decimal(str(payload["credit_amount"] or 0))
+
+        # Update classification suggestion if provided
+        suggested_ledger = payload.get("suggested_ledger")
+        suggested_voucher_type = payload.get("suggested_voucher_type")
+        if (suggested_ledger or suggested_voucher_type) and tx.classification:
+            if suggested_ledger:
+                tx.classification.suggested_ledger = suggested_ledger
+            if suggested_voucher_type:
+                tx.classification.suggested_voucher_type = suggested_voucher_type
+
+        db.commit()
+        db.refresh(tx)
+        return jsonify(BankTransactionOut.model_validate(tx).model_dump(mode="json")), 200
+    except Exception as e:
+        db.rollback()
+        return jsonify({"detail": f"Failed to edit transaction: {str(e)}"}), 400
+    finally:
+        db.close()
+
+
+def reject_transaction(tx_id: int):
+    """Rejects a proposed voucher and logs the rejection reason."""
+    payload = request.get_json(silent=True) or {}
+    reason = payload.get("reason", "Rejected by user")
+    db = SessionLocal()
+    try:
+        repo = TransactionRepository(db)
+        tx = repo.get_by_id(tx_id)
+        if not tx:
+            return jsonify({"detail": "Transaction not found"}), 404
+
+        tx.status = "REJECTED"
+        tx.rejection_reason = reason
+        db.commit()
+        db.refresh(tx)
+        return jsonify({
+            "message": f"Transaction #{tx_id} rejected",
+            "transaction": BankTransactionOut.model_validate(tx).model_dump()
+        }), 200
+    except Exception as e:
+        db.rollback()
+        return jsonify({"detail": f"Failed to reject transaction: {str(e)}"}), 400
+    finally:
+        db.close()
+
+
+def hold_transaction(tx_id: int):
+    """Puts a proposed voucher on hold to pause approval."""
+    db = SessionLocal()
+    try:
+        repo = TransactionRepository(db)
+        tx = repo.get_by_id(tx_id)
+        if not tx:
+            return jsonify({"detail": "Transaction not found"}), 404
+
+        tx.status = "HOLD"
+        db.commit()
+        db.refresh(tx)
+        return jsonify({
+            "message": f"Transaction #{tx_id} put on hold",
+            "transaction": BankTransactionOut.model_validate(tx).model_dump()
+        }), 200
+    except Exception as e:
+        db.rollback()
+        return jsonify({"detail": f"Failed to hold transaction: {str(e)}"}), 400
+    finally:
+        db.close()
+
+
+def unhold_transaction(tx_id: int):
+    """Restores a held transaction back to pending approval."""
+    db = SessionLocal()
+    try:
+        repo = TransactionRepository(db)
+        tx = repo.get_by_id(tx_id)
+        if not tx:
+            return jsonify({"detail": "Transaction not found"}), 404
+
+        tx.status = "PENDING_APPROVAL"
+        db.commit()
+        db.refresh(tx)
+        return jsonify({
+            "message": f"Transaction #{tx_id} resumed to Pending Approval",
+            "transaction": BankTransactionOut.model_validate(tx).model_dump()
+        }), 200
+    except Exception as e:
+        db.rollback()
+        return jsonify({"detail": f"Failed to resume transaction: {str(e)}"}), 400
+    finally:
+        db.close()
+
+
+def delete_transaction(tx_id: int):
+    """Permanently deletes a draft / proposed transaction."""
+    db = SessionLocal()
+    try:
+        repo = TransactionRepository(db)
+        tx = repo.get_by_id(tx_id)
+        if not tx:
+            return jsonify({"detail": "Transaction not found"}), 404
+
+        db.delete(tx)
+        db.commit()
+        return jsonify({"message": f"Transaction #{tx_id} deleted successfully"}), 200
+    except Exception as e:
+        db.rollback()
+        return jsonify({"detail": f"Failed to delete transaction: {str(e)}"}), 400
+    finally:
+        db.close()
+
+
+def get_transaction_source(tx_id: int):
+    """Returns source document and raw bank line details for a proposed voucher."""
+    db = SessionLocal()
+    try:
+        repo = TransactionRepository(db)
+        tx = repo.get_by_id(tx_id)
+        if not tx:
+            return jsonify({"detail": "Transaction not found"}), 404
+
+        batch = tx.batch
+        return jsonify({
+            "transaction_id": tx.id,
+            "source_document": {
+                "batch_id": batch.batch_id if batch else "MANUAL",
+                "filename": batch.filename if batch else "Direct Input",
+                "file_path": batch.file_path if batch else None,
+                "file_hash": batch.file_hash if batch else None,
+                "file_size_bytes": batch.file_size_bytes if batch else 0,
+                "source_row_index": tx.source_row_index,
+                "imported_at": batch.created_at.isoformat() if batch else None,
+            },
+            "raw_bank_entry": {
+                "bank_reference": tx.bank_reference,
+                "cheque_number": tx.cheque_number,
+                "transaction_date": tx.transaction_date.isoformat(),
+                "value_date": tx.value_date.isoformat() if tx.value_date else None,
+                "raw_narration": tx.narration,
+                "debit_amount": float(tx.debit_amount),
+                "credit_amount": float(tx.credit_amount),
+                "balance": float(tx.balance) if tx.balance else None,
+                "raw_payload": tx.raw_payload
+            }
+        }), 200
     finally:
         db.close()

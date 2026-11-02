@@ -168,6 +168,7 @@ class BankTransactionOut(BaseModel):
     requires_review: bool
     is_skipped: bool
     skip_reason: Optional[str]
+    rejection_reason: Optional[str] = None
     reconciliation_status: str
     created_at: datetime
     classification: Optional[TransactionClassificationOut] = None
@@ -322,14 +323,27 @@ class AuditLogOut(BaseModel):
 
 
 class DashboardSummaryOut(BaseModel):
+    # HLA 9.5 Financial Metrics
+    total_income: Decimal = Decimal("0.00")
+    total_expenditure: Decimal = Decimal("0.00")
+    current_profit_loss: Decimal = Decimal("0.00")
+    cash_balance: Decimal = Decimal("0.00")
+    bank_balance: Decimal = Decimal("0.00")
+    outstanding_receivables: Decimal = Decimal("0.00")
+    outstanding_payables: Decimal = Decimal("0.00")
+
+    # HLA 9.5 Operational & Document Metrics
+    pending_vouchers: int = 0
+    unprocessed_documents: int = 0
+    documents_requiring_attention: int = 0
+
+    # Pipeline Metrics
     total_transactions: int = 0
     processed_transactions: int = 0
     clarification_queue_count: int = 0
     approval_queue_count: int = 0
     failed_transactions: int = 0
     skipped_transactions: int = 0
-    bank_balance: Decimal = Decimal("0.00")
-    cash_balance: Decimal = Decimal("0.00")
     total_receivables: Decimal = Decimal("0.00")
     total_payables: Decimal = Decimal("0.00")
     tally_connection_status: str = "offline"

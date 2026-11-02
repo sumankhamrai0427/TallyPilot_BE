@@ -417,3 +417,86 @@ def get_ledger_balances():
         return jsonify({"detail": str(e)}), 500
     finally:
         db.close()
+
+
+def reverse_voucher(voucher_id: int):
+    """Controlled reversal of a posted voucher (HLA Part 7.5)."""
+    db = SessionLocal()
+    try:
+        company_id, _ = resolve_tenant_context(db)
+        payload = request.get_json() or {}
+        reason = payload.get("reason", "").strip()
+
+        if not reason:
+            return jsonify({"detail": "Reversal reason is required."}), 400
+
+        rev_voucher = VoucherService.reverse_voucher(
+            db=db,
+            voucher_id=voucher_id,
+            company_id=company_id,
+            reason=reason,
+            created_by=payload.get("user", "USER")
+        )
+        db.commit()
+
+        return jsonify({
+            "message": f"Successfully created reversal voucher {rev_voucher.voucher_number}",
+            "original_voucher_id": voucher_id,
+            "reversal_voucher_id": rev_voucher.id,
+            "reversal_voucher_number": rev_voucher.voucher_number,
+            "status": "REVERSED"
+        }), 200
+    except ValueError as ve:
+        db.rollback()
+        return jsonify({"detail": str(ve)}), 400
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Error reversing voucher {voucher_id}: {e}")
+        return jsonify({"detail": str(e)}), 500
+    finally:
+        db.close()
+
+
+def update_voucher(voucher_id: int):
+    """Manual editing of draft double-entry vouchers (HLA Part 7.6)."""
+    db = SessionLocal()
+    try:
+        company_id, _ = resolve_tenant_context(db)
+        payload = request.get_json() or {}
+
+        voucher_date_str = payload.get("voucher_date")
+        if not voucher_date_str:
+            return jsonify({"detail": "voucher_date is required."}), 400
+        voucher_date = datetime.strptime(voucher_date_str, "%Y-%m-%d").date()
+
+        lines = payload.get("lines", [])
+        if not lines or len(lines) < 2:
+            return jsonify({"detail": "At least two lines are required for a double-entry voucher."}), 400
+
+        voucher = VoucherService.update_draft_voucher(
+            db=db,
+            voucher_id=voucher_id,
+            company_id=company_id,
+            voucher_date=voucher_date,
+            narration=payload.get("narration", ""),
+            lines_data=lines,
+            voucher_type=payload.get("voucher_type")
+        )
+        db.commit()
+
+        return jsonify({
+            "message": f"Voucher {voucher.voucher_number} updated successfully",
+            "voucher_id": voucher.id,
+            "voucher_number": voucher.voucher_number,
+            "status": voucher.status
+        }), 200
+    except ValueError as ve:
+        db.rollback()
+        return jsonify({"detail": str(ve)}), 400
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Error updating draft voucher {voucher_id}: {e}")
+        return jsonify({"detail": str(e)}), 500
+    finally:
+        db.close()
+

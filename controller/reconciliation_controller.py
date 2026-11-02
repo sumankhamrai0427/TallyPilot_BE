@@ -203,3 +203,213 @@ def match_transaction():
         return jsonify({"detail": str(e)}), 500
     finally:
         db.close()
+
+
+def run_auto_reconcile():
+    """HLA Part 11: Runs automated reconciliation and duplicate detection."""
+    db = SessionLocal()
+    try:
+        from services.reconciliation_service import ReconciliationService
+        company_id, _ = resolve_tenant_context(db)
+        result = ReconciliationService.auto_reconcile_with_books(db, company_id)
+        return jsonify({
+            "message": f"Auto-reconciliation complete: {result['matched_count']} entries matched, {result['duplicates_flagged']} duplicates detected",
+            "matched_count": result["matched_count"],
+            "duplicates_flagged": result["duplicates_flagged"]
+        }), 200
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Error running auto-reconciliation: {e}")
+        return jsonify({"detail": str(e)}), 500
+    finally:
+        db.close()
+
+
+def get_reconciliation_views():
+    """HLA Part 11: Structured views for Matched, Unmatched Bank, Unmatched Books, Duplicates, and Date Differences."""
+    db = SessionLocal()
+    try:
+        from model.models import Voucher
+        company_id, _ = resolve_tenant_context(db)
+        view = request.args.get("view", "matched")
+        today = date.today()
+
+        # Find bank ledger IDs
+        bank_ledgers = (
+            db.query(LedgerAccount.id)
+            .join(AccountGroup, AccountGroup.id == LedgerAccount.group_id)
+            .filter(
+                LedgerAccount.company_id == company_id,
+                AccountGroup.name.in_(("Bank Accounts", "Bank OD A/c"))
+            )
+            .all()
+        )
+        bank_ledger_ids = [bl[0] for bl in bank_ledgers]
+
+        if view == "matched":
+            # Reconciled bank transactions with linked vouchers
+            txs = (
+                db.query(BankTransaction)
+                .filter(
+                    BankTransaction.company_id == company_id,
+                    BankTransaction.reconciliation_status == "RECONCILED"
+                )
+                .order_by(BankTransaction.transaction_date.desc())
+                .all()
+            )
+            results = []
+            for t in txs:
+                # Find linked voucher
+                v = t.matched_voucher
+                if not v and t.id:
+                    v = db.query(Voucher).filter(Voucher.bank_transaction_id == t.id).first()
+
+                clearance_dt = t.clearance_date or t.transaction_date
+                v_date = v.voucher_date if v else None
+                lag = (clearance_dt - v_date).days if (clearance_dt and v_date) else 0
+
+                results.append({
+                    "id": t.id,
+                    "date": t.transaction_date.isoformat(),
+                    "clearance_date": clearance_dt.isoformat() if clearance_dt else None,
+                    "bank_reference": t.bank_reference,
+                    "narration": t.narration,
+                    "amount": float(t.amount),
+                    "transaction_type": t.transaction_type,
+                    "voucher_id": v.id if v else None,
+                    "voucher_number": v.voucher_number if v else "—",
+                    "voucher_type": v.voucher_type.value if (v and hasattr(v.voucher_type, "value")) else (str(v.voucher_type) if v else None),
+                    "voucher_date": v_date.isoformat() if v_date else None,
+                    "lag_days": lag
+                })
+            return jsonify({"items": results, "total": len(results)}), 200
+
+        elif view == "unmatched_bank":
+            # Bank transactions without corresponding books voucher
+            txs = (
+                db.query(BankTransaction)
+                .filter(
+                    BankTransaction.company_id == company_id,
+                    BankTransaction.reconciliation_status != "RECONCILED",
+                    BankTransaction.is_duplicate == False
+                )
+                .order_by(BankTransaction.transaction_date.desc())
+                .all()
+            )
+            results = [
+                {
+                    "id": t.id,
+                    "date": t.transaction_date.isoformat(),
+                    "bank_reference": t.bank_reference,
+                    "narration": t.narration,
+                    "amount": float(t.amount),
+                    "transaction_type": t.transaction_type,
+                    "suggested_ledger": t.suggested_ledger,
+                    "suggested_voucher_type": t.classification.suggested_voucher_type if t.classification else ("Payment" if t.transaction_type == "DEBIT" else "Receipt"),
+                    "status": t.status
+                }
+                for t in txs
+            ]
+            return jsonify({"items": results, "total": len(results)}), 200
+
+        elif view == "unmatched_books":
+            # Book vouchers on bank accounts not cleared in the bank
+            v_lines = (
+                db.query(VoucherLine, Voucher)
+                .join(Voucher, Voucher.id == VoucherLine.voucher_id)
+                .filter(
+                    VoucherLine.company_id == company_id,
+                    VoucherLine.ledger_id.in_(bank_ledger_ids) if bank_ledger_ids else True,
+                    Voucher.status == "POSTED",
+                    Voucher.bank_transaction_id.is_(None)
+                )
+                .order_by(Voucher.voucher_date.desc())
+                .all()
+            )
+            results = []
+            for vl, v in v_lines:
+                v_dt = v.voucher_date
+                age_days = (today - v_dt).days if v_dt else 0
+                amount = float(vl.credit_amount) if vl.credit_amount > 0 else float(vl.debit_amount)
+                nature = "ISSUE (Payment)" if vl.credit_amount > 0 else "DEPOSIT (Receipt)"
+                results.append({
+                    "voucher_id": v.id,
+                    "voucher_line_id": vl.id,
+                    "voucher_number": v.voucher_number,
+                    "voucher_date": v_dt.isoformat(),
+                    "voucher_type": v.voucher_type.value if hasattr(v.voucher_type, "value") else str(v.voucher_type),
+                    "ledger_name": vl.ledger.name if vl.ledger else "Bank",
+                    "amount": amount,
+                    "nature": nature,
+                    "narration": vl.narration or v.narration,
+                    "age_days": age_days
+                })
+            return jsonify({"items": results, "total": len(results)}), 200
+
+        elif view == "duplicates":
+            # Duplicate transactions
+            txs = (
+                db.query(BankTransaction)
+                .filter(
+                    BankTransaction.company_id == company_id,
+                    BankTransaction.is_duplicate == True
+                )
+                .order_by(BankTransaction.transaction_date.desc())
+                .all()
+            )
+            results = [
+                {
+                    "id": t.id,
+                    "date": t.transaction_date.isoformat(),
+                    "bank_reference": t.bank_reference,
+                    "narration": t.narration,
+                    "amount": float(t.amount),
+                    "transaction_type": t.transaction_type,
+                    "flag_reason": "Duplicate bank reference or duplicate amount & date detected"
+                }
+                for t in txs
+            ]
+            return jsonify({"items": results, "total": len(results)}), 200
+
+        elif view == "date_differences":
+            # Reconciled items where Clearance Date != Voucher Date
+            txs = (
+                db.query(BankTransaction)
+                .filter(
+                    BankTransaction.company_id == company_id,
+                    BankTransaction.reconciliation_status == "RECONCILED"
+                )
+                .all()
+            )
+            results = []
+            for t in txs:
+                v = t.matched_voucher
+                if not v and t.id:
+                    v = db.query(Voucher).filter(Voucher.bank_transaction_id == t.id).first()
+
+                clearance_dt = t.clearance_date or t.transaction_date
+                v_date = v.voucher_date if v else None
+                if clearance_dt and v_date and clearance_dt != v_date:
+                    lag = (clearance_dt - v_date).days
+                    results.append({
+                        "id": t.id,
+                        "bank_reference": t.bank_reference,
+                        "narration": t.narration,
+                        "amount": float(t.amount),
+                        "transaction_type": t.transaction_type,
+                        "voucher_number": v.voucher_number if v else "—",
+                        "voucher_date": v_date.isoformat(),
+                        "clearance_date": clearance_dt.isoformat(),
+                        "lag_days": lag,
+                        "lag_description": f"{abs(lag)} days {'delay in bank clearing' if lag > 0 else 'prior bank debit'}"
+                    })
+            results.sort(key=lambda x: abs(x["lag_days"]), reverse=True)
+            return jsonify({"items": results, "total": len(results)}), 200
+
+        return jsonify({"detail": f"Unknown view {view}"}), 400
+    except Exception as e:
+        logger.error(f"Error fetching reconciliation view {request.args.get('view')}: {e}")
+        return jsonify({"detail": str(e)}), 500
+    finally:
+        db.close()
+

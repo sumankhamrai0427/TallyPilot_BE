@@ -160,6 +160,36 @@ def create_app() -> Flask:
         """Resets a failed or skipped transaction for retry."""
         return transactions_controller.retry_transaction(tx_id)
 
+    @app.route("/api/transactions/<int:tx_id>", methods=["PUT"])
+    def api_transactions_edit(tx_id: int):
+        """HLA 9.4 Edit Action: Updates proposed voucher fields."""
+        return transactions_controller.edit_transaction(tx_id)
+
+    @app.route("/api/transactions/<int:tx_id>/reject", methods=["POST"])
+    def api_transactions_reject(tx_id: int):
+        """HLA 9.4 Reject Action: Rejects a proposed voucher."""
+        return transactions_controller.reject_transaction(tx_id)
+
+    @app.route("/api/transactions/<int:tx_id>/hold", methods=["POST"])
+    def api_transactions_hold(tx_id: int):
+        """HLA 9.4 Hold Action: Puts a proposed voucher on hold."""
+        return transactions_controller.hold_transaction(tx_id)
+
+    @app.route("/api/transactions/<int:tx_id>/unhold", methods=["POST"])
+    def api_transactions_unhold(tx_id: int):
+        """Restores a held proposed voucher to pending approval."""
+        return transactions_controller.unhold_transaction(tx_id)
+
+    @app.route("/api/transactions/<int:tx_id>", methods=["DELETE"])
+    def api_transactions_delete(tx_id: int):
+        """HLA 9.4 Delete Draft Action: Deletes proposed voucher."""
+        return transactions_controller.delete_transaction(tx_id)
+
+    @app.route("/api/transactions/<int:tx_id>/source", methods=["GET"])
+    def api_transactions_source(tx_id: int):
+        """HLA 9.4 View Source Action: Returns source file and raw bank row."""
+        return transactions_controller.get_transaction_source(tx_id)
+
     # ============================================================
     # 5. Tally Prime Integration Endpoints
     # ============================================================
@@ -300,6 +330,16 @@ def create_app() -> Flask:
         """Posts an approved voucher to the General Ledger."""
         return vouchers_controller.post_voucher(voucher_id)
 
+    @app.route("/api/vouchers/<int:voucher_id>/reverse", methods=["POST"])
+    def api_vouchers_reverse(voucher_id: int):
+        """Controlled reversal of a posted voucher (HLA Part 7.5)."""
+        return vouchers_controller.reverse_voucher(voucher_id)
+
+    @app.route("/api/vouchers/<int:voucher_id>", methods=["PUT"])
+    def api_vouchers_update(voucher_id: int):
+        """Manual editing of draft vouchers (HLA Part 7.6)."""
+        return vouchers_controller.update_voucher(voucher_id)
+
     @app.route("/api/vouchers/generate-from-transaction/<int:tx_id>", methods=["POST"])
     def api_vouchers_generate_from_tx(tx_id: int):
         """Auto-generates balanced double-entry voucher from a bank transaction."""
@@ -333,13 +373,28 @@ def create_app() -> Flask:
         """Matches a bank transaction with a voucher line."""
         return reconciliation_controller.match_transaction()
 
+    @app.route("/api/reconciliation/views", methods=["GET"])
+    def api_recon_views():
+        """HLA Part 11: Structured views for Matched, Unmatched, Duplicates, and Date Differences."""
+        return reconciliation_controller.get_reconciliation_views()
+
+    @app.route("/api/reconciliation/auto-reconcile", methods=["POST"])
+    def api_recon_auto():
+        """HLA Part 11: Runs automated matching and duplicate detection."""
+        return reconciliation_controller.run_auto_reconcile()
+
     # ============================================================
     # 11. Financial Reporting Endpoints (HLA Part 10)
     # ============================================================
     @app.route("/api/reports/day-book", methods=["GET"])
     def api_reports_day_book():
-        """Returns filtered Day Book entries."""
+        """Returns filtered Day Book entries (HLA Part 10.1)."""
         return reports_controller.get_day_book()
+
+    @app.route("/api/reports/ledger/<int:ledger_id>", methods=["GET"])
+    def api_reports_ledger(ledger_id: int):
+        """Generates Ledger Statement with running balances (HLA Part 10.2)."""
+        return reports_controller.get_ledger_report(ledger_id)
 
     @app.route("/api/reports/trial-balance", methods=["GET"])
     def api_reports_trial_balance():

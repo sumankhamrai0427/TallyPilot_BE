@@ -23,6 +23,8 @@ class TransactionStatus(str, enum.Enum):
     PROCESSED = "PROCESSED"
     FAILED = "FAILED"
     SKIPPED = "SKIPPED"
+    REJECTED = "REJECTED"
+    HOLD = "HOLD"
 
 
 class VoucherType(str, enum.Enum):
@@ -32,6 +34,13 @@ class VoucherType(str, enum.Enum):
     JOURNAL = "Journal"
     SALES = "Sales"
     PURCHASE = "Purchase"
+    DEBIT_NOTE = "Debit Note"
+    CREDIT_NOTE = "Credit Note"
+    PAYROLL = "Payroll"
+    OPENING_BALANCE = "Opening Balance"
+    FIXED_ASSET = "Fixed Asset"
+    DEPRECIATION = "Depreciation"
+    ADJUSTMENT = "Adjustment"
 
 
 class VoucherStatus(str, enum.Enum):
@@ -41,6 +50,8 @@ class VoucherStatus(str, enum.Enum):
     POSTED = "POSTED"
     REVERSED = "REVERSED"
     CANCELLED = "CANCELLED"
+    REJECTED = "REJECTED"
+    HOLD = "HOLD"
 
 
 class AccountGroupType(str, enum.Enum):
@@ -270,9 +281,11 @@ class BankTransaction(Base):
     company_id = Column(Integer, ForeignKey("companies.id", ondelete="RESTRICT"), nullable=False, index=True)
     batch_id = Column(Integer, ForeignKey("import_batches.id", ondelete="RESTRICT"), nullable=False, index=True)
     bank_ledger_id = Column(Integer, ForeignKey("ledger_accounts.id", ondelete="RESTRICT"), nullable=False)
+    matched_voucher_id = Column(Integer, ForeignKey("vouchers.id", ondelete="SET NULL"), nullable=True, index=True)
     source_row_index = Column(Integer, nullable=False)
     transaction_date = Column(Date, nullable=False, index=True)
     value_date = Column(Date, nullable=True)
+    clearance_date = Column(Date, nullable=True)
     bank_reference = Column(String(128), nullable=True, index=True)
     cheque_number = Column(String(64), nullable=True)
     narration = Column(Text, nullable=False)
@@ -282,7 +295,9 @@ class BankTransaction(Base):
     status = Column(String(32), default=TransactionStatus.RECEIVED.value, nullable=False, index=True)
     requires_review = Column(Boolean, default=False, nullable=False)
     is_skipped = Column(Boolean, default=False, nullable=False)
+    is_duplicate = Column(Boolean, default=False, nullable=False)
     skip_reason = Column(Text, nullable=True)
+    rejection_reason = Column(Text, nullable=True)
     reconciliation_status = Column(String(32), default="UNRECONCILED", nullable=False)
     raw_payload = Column(JSON, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
@@ -293,6 +308,7 @@ class BankTransaction(Base):
     reviews = relationship("HumanReview", back_populates="transaction", cascade="all, delete-orphan")
     approvals = relationship("ApprovalRecord", back_populates="transaction", cascade="all, delete-orphan")
     submissions = relationship("TallySubmission", back_populates="transaction", cascade="all, delete-orphan")
+    matched_voucher = relationship("Voucher", foreign_keys=[matched_voucher_id])
 
     @property
     def amount(self):
@@ -370,11 +386,15 @@ class Voucher(Base):
     voucher_date = Column(Date, nullable=False, index=True)
     total_amount = Column(Numeric(15, 2), default=0.00, nullable=False)
     narration = Column(Text, nullable=True)
+    rejection_reason = Column(Text, nullable=True)
     bank_transaction_id = Column(Integer, ForeignKey("bank_transactions.id", ondelete="RESTRICT"), nullable=True)
     source_document_id = Column(Integer, ForeignKey("documents.id", ondelete="RESTRICT"), nullable=True)
     status = Column(String(32), default=VoucherStatus.DRAFT.value, nullable=False, index=True)
+    reversal_voucher_id = Column(Integer, ForeignKey("vouchers.id", ondelete="SET NULL"), nullable=True)
+    reversal_reason = Column(String(255), nullable=True)
     created_by = Column(String(128), default="SYSTEM", nullable=False)
     posted_at = Column(DateTime, nullable=True)
+    reversed_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
 
@@ -398,6 +418,9 @@ class VoucherLine(Base):
     debit_amount = Column(Numeric(15, 2), default=0.00, nullable=False)
     credit_amount = Column(Numeric(15, 2), default=0.00, nullable=False)
     narration = Column(String(500), nullable=True)
+    cost_centre = Column(String(100), nullable=True)
+    tax_code = Column(String(50), nullable=True)
+    party_reference = Column(String(100), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
     voucher = relationship("Voucher", back_populates="lines")

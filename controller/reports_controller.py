@@ -19,7 +19,7 @@ from utils.logger import logger
 
 
 def get_day_book():
-    """Returns Day Book entries with date and voucher filtering (HLA Part 10.1)."""
+    """Returns Day Book entries with date, voucher, status, and ledger filtering (HLA Part 10.1)."""
     db = SessionLocal()
     try:
         company_id, fy_id = resolve_tenant_context(db)
@@ -28,19 +28,27 @@ def get_day_book():
         to_date = request.args.get("to_date")
         voucher_type = request.args.get("voucher_type")
         ledger_id = request.args.get("ledger_id", type=int)
+        status = request.args.get("status")
+        search = request.args.get("search")
+        debit_credit = request.args.get("debit_credit")  # 'DEBIT' or 'CREDIT'
 
         query = (
             db.query(
+                Voucher.id.label("voucher_id"),
                 Voucher.voucher_date,
                 Voucher.voucher_number,
                 Voucher.voucher_type,
                 Voucher.narration,
+                Voucher.source_document_id,
+                Voucher.bank_transaction_id,
+                Voucher.status,
+                VoucherLine.id.label("line_id"),
                 VoucherLine.line_number,
                 LedgerAccount.id.label("ledger_id"),
                 LedgerAccount.name.label("ledger_name"),
                 VoucherLine.debit_amount,
                 VoucherLine.credit_amount,
-                Voucher.status
+                VoucherLine.narration.label("line_narration")
             )
             .join(VoucherLine, VoucherLine.voucher_id == Voucher.id)
             .join(LedgerAccount, LedgerAccount.id == VoucherLine.ledger_id)
@@ -57,22 +65,41 @@ def get_day_book():
             query = query.filter(Voucher.voucher_type == voucher_type)
         if ledger_id:
             query = query.filter(VoucherLine.ledger_id == ledger_id)
+        if status and status.upper() != "ALL":
+            query = query.filter(Voucher.status == status)
+        if search:
+            search_pattern = f"%{search}%"
+            query = query.filter(
+                or_(
+                    Voucher.voucher_number.ilike(search_pattern),
+                    Voucher.narration.ilike(search_pattern),
+                    LedgerAccount.name.ilike(search_pattern)
+                )
+            )
+        if debit_credit == "DEBIT":
+            query = query.filter(VoucherLine.debit_amount > 0)
+        elif debit_credit == "CREDIT":
+            query = query.filter(VoucherLine.credit_amount > 0)
 
         rows = query.order_by(Voucher.voucher_date.desc(), Voucher.id.desc(), VoucherLine.line_number.asc()).all()
 
         results = []
         for r in rows:
+            v_type = r.voucher_type.value if hasattr(r.voucher_type, "value") else str(r.voucher_type)
+            v_status = r.status.value if hasattr(r.status, "value") else str(r.status)
             results.append({
+                "voucher_id": r.voucher_id,
                 "date": r.voucher_date.isoformat(),
                 "voucher_number": r.voucher_number,
-                "voucher_type": r.voucher_type,
-                "narration": r.narration,
+                "voucher_type": v_type,
+                "narration": r.line_narration or r.narration,
                 "line_number": r.line_number,
                 "ledger_id": r.ledger_id,
                 "ledger_name": r.ledger_name,
                 "debit_amount": float(r.debit_amount),
                 "credit_amount": float(r.credit_amount),
-                "status": r.status
+                "source_document": f"Bank Tx #{r.bank_transaction_id}" if r.bank_transaction_id else (f"Doc #{r.source_document_id}" if r.source_document_id else "Manual Entry"),
+                "status": v_status
             })
 
         return jsonify({
@@ -86,6 +113,172 @@ def get_day_book():
         return jsonify({"detail": str(e)}), 500
     finally:
         db.close()
+
+
+def get_ledger_report(ledger_id: int):
+    """Generates the Ledger Statement with Running Balances (HLA Part 10.2)."""
+    db = SessionLocal()
+    try:
+        company_id, fy_id = resolve_tenant_context(db)
+
+        ledger = (
+            db.query(LedgerAccount, AccountGroup)
+            .join(AccountGroup, AccountGroup.id == LedgerAccount.group_id)
+            .filter(
+                LedgerAccount.id == ledger_id,
+                LedgerAccount.company_id == company_id
+            )
+            .first()
+        )
+
+        if not ledger:
+            return jsonify({"detail": f"Ledger ID {ledger_id} not found"}), 404
+
+        acc, grp = ledger
+        from_date = request.args.get("from_date")
+        to_date = request.args.get("to_date")
+        voucher_type = request.args.get("voucher_type")
+
+        # 1. Calculate Opening Balance before `from_date`
+        op_dr = Decimal("0.00")
+        op_cr = Decimal("0.00")
+
+        # Start with configured ledger opening_balance
+        init_op = acc.opening_balance or Decimal("0.00")
+        nature = grp.nature  # 'DEBIT' or 'CREDIT'
+
+        # Fetch prior postings if from_date is provided
+        if from_date:
+            prior_query = (
+                db.query(
+                    func.sum(GeneralLedger.debit_amount).label("prior_dr"),
+                    func.sum(GeneralLedger.credit_amount).label("prior_cr")
+                )
+                .filter(
+                    GeneralLedger.ledger_id == ledger_id,
+                    GeneralLedger.company_id == company_id,
+                    GeneralLedger.posting_date < from_date,
+                    GeneralLedger.is_reversed == False
+                )
+            )
+            if fy_id:
+                prior_query = prior_query.filter(GeneralLedger.fy_id == fy_id)
+
+            prior_res = prior_query.first()
+            if prior_res:
+                op_dr = prior_res.prior_dr or Decimal("0.00")
+                op_cr = prior_res.prior_cr or Decimal("0.00")
+
+        # Calculate net opening balance amount and nature
+        net_signed_opening = (init_op if nature == "DEBIT" else -init_op) + (op_dr - op_cr)
+        opening_nature = "DR" if net_signed_opening >= 0 else "CR"
+        opening_balance = abs(net_signed_opening)
+
+        # 2. Query transactions in the period
+        period_query = (
+            db.query(
+                GeneralLedger.id,
+                GeneralLedger.posting_date,
+                GeneralLedger.debit_amount,
+                GeneralLedger.credit_amount,
+                GeneralLedger.voucher_id,
+                Voucher.voucher_number,
+                Voucher.voucher_type,
+                Voucher.narration
+            )
+            .join(Voucher, Voucher.id == GeneralLedger.voucher_id)
+            .filter(
+                GeneralLedger.ledger_id == ledger_id,
+                GeneralLedger.company_id == company_id,
+                GeneralLedger.is_reversed == False
+            )
+        )
+
+        if fy_id:
+            period_query = period_query.filter(GeneralLedger.fy_id == fy_id)
+        if from_date:
+            period_query = period_query.filter(GeneralLedger.posting_date >= from_date)
+        if to_date:
+            period_query = period_query.filter(GeneralLedger.posting_date <= to_date)
+        if voucher_type:
+            period_query = period_query.filter(Voucher.voucher_type == voucher_type)
+
+        period_entries = period_query.order_by(GeneralLedger.posting_date.asc(), GeneralLedger.id.asc()).all()
+
+        # Collect opposing ledger particulars for each voucher
+        running_signed = net_signed_opening
+        items = []
+        total_period_debit = Decimal("0.00")
+        total_period_credit = Decimal("0.00")
+
+        for entry in period_entries:
+            dr = entry.debit_amount or Decimal("0.00")
+            cr = entry.credit_amount or Decimal("0.00")
+            total_period_debit += dr
+            total_period_credit += cr
+
+            running_signed += (dr - cr)
+            curr_nature = "DR" if running_signed >= 0 else "CR"
+
+            # Determine particulars: opposing lines in the voucher
+            opposing_ledgers = (
+                db.query(LedgerAccount.name)
+                .join(VoucherLine, VoucherLine.ledger_id == LedgerAccount.id)
+                .filter(
+                    VoucherLine.voucher_id == entry.voucher_id,
+                    VoucherLine.ledger_id != ledger_id
+                )
+                .distinct()
+                .all()
+            )
+
+            if len(opposing_ledgers) == 1:
+                particulars = opposing_ledgers[0][0]
+            elif len(opposing_ledgers) > 1:
+                particulars = f"As per details ({', '.join(l[0] for l in opposing_ledgers[:2])}...)"
+            else:
+                particulars = entry.narration or "Journal Entry"
+
+            v_type_str = entry.voucher_type.value if hasattr(entry.voucher_type, "value") else str(entry.voucher_type)
+
+            items.append({
+                "id": entry.id,
+                "date": entry.posting_date.isoformat(),
+                "voucher_id": entry.voucher_id,
+                "voucher_number": entry.voucher_number,
+                "voucher_type": v_type_str,
+                "particulars": particulars,
+                "debit_amount": float(dr),
+                "credit_amount": float(cr),
+                "running_balance": float(abs(running_signed)),
+                "balance_nature": curr_nature
+            })
+
+        closing_balance = abs(running_signed)
+        closing_nature = "DR" if running_signed >= 0 else "CR"
+
+        return jsonify({
+            "ledger_id": acc.id,
+            "ledger_name": acc.name,
+            "ledger_code": acc.code,
+            "group_name": grp.name,
+            "group_type": grp.group_type,
+            "from_date": from_date,
+            "to_date": to_date,
+            "opening_balance": float(opening_balance),
+            "opening_balance_nature": opening_nature,
+            "items": items,
+            "total_period_debit": float(total_period_debit),
+            "total_period_credit": float(total_period_credit),
+            "closing_balance": float(closing_balance),
+            "closing_balance_nature": closing_nature
+        }), 200
+    except Exception as e:
+        logger.error(f"Error fetching Ledger Report for ledger {ledger_id}: {e}")
+        return jsonify({"detail": str(e)}), 500
+    finally:
+        db.close()
+
 
 
 def get_trial_balance():
