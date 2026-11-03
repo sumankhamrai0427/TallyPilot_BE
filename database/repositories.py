@@ -130,19 +130,23 @@ class CompanyRepository:
         if isinstance(end_date, str):
             end_date = date.fromisoformat(end_date)
 
-        is_current = bool(data.get("is_current", False))
-        if is_current:
-            # Unset existing current FY for this company
+        is_current_requested = bool(data.get("is_current", False))
+        if is_current_requested:
+            # Unset existing current FY for this company to NULL
+            # (MySQL chk_fy_current requires is_current IS NULL OR is_current = 1)
             self.db.query(FinancialYear).filter(
                 FinancialYear.company_id == company_id
-            ).update({"is_current": False})
+            ).update({"is_current": None})
+            db_is_current = 1
+        else:
+            db_is_current = None
 
         fy = FinancialYear(
             company_id=company_id,
             fy_code=data["fy_code"],
             start_date=start_date,
             end_date=end_date,
-            is_current=is_current,
+            is_current=db_is_current,
             is_closed=bool(data.get("is_closed", False))
         )
         self.db.add(fy)
@@ -154,10 +158,11 @@ class CompanyRepository:
         fy = self.get_financial_year(fy_id)
         if not fy or fy.company_id != company_id:
             return None
+        # MySQL uq_fy_comp_current & chk_fy_current require NULL for non-current years
         self.db.query(FinancialYear).filter(
             FinancialYear.company_id == company_id
-        ).update({"is_current": False})
-        fy.is_current = True
+        ).update({"is_current": None})
+        fy.is_current = 1
         self.db.commit()
         self.db.refresh(fy)
         return fy
@@ -542,6 +547,10 @@ class AuditRepository:
         new_status: Optional[str] = None,
         details: Optional[Dict[str, Any]] = None
     ) -> AuditLog:
+        if company_id is None:
+            comp = self.db.query(Company).filter(Company.is_active == True).first()
+            company_id = comp.id if comp else 1
+
         entry = AuditLog(
             action=action,
             summary=summary,

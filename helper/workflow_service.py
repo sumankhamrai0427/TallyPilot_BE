@@ -3,13 +3,16 @@ import uuid
 from decimal import Decimal
 from typing import List, Dict, Any, Optional
 from sqlalchemy.orm import Session
+from sqlalchemy import func
 from model.models import (
     BankTransaction, ImportBatch, TransactionClassification,
-    HumanReview, ApprovalRecord, TallySubmission, TransactionStatus, VoucherType
+    HumanReview, ApprovalRecord, TallySubmission, TransactionStatus, VoucherType,
+    LedgerAccount, AccountGroup
 )
 from database.repositories import (
     TransactionRepository, BatchRepository, LedgerRepository, AuditRepository
 )
+from helper.tenant import resolve_tenant_context
 from helper.excel_reader import ExcelReaderService
 from helper.local_llm import LocalLLMService
 from helper.accounting_validator import AccountingValidatorService
@@ -32,6 +35,9 @@ class WorkflowService:
         self.tally_client = TallyClientService()
 
     def ingest_excel_file(self, file_path: str, filename: str) -> ImportBatch:
+        # Resolve multi-tenant context
+        company_id, fy_id = resolve_tenant_context(self.db)
+
         # 1. Read file and check hash for duplicates
         file_hash, file_size, _ = self.excel_reader.read_and_validate_file(file_path)
 
@@ -40,13 +46,37 @@ class WorkflowService:
             self.audit_repo.log(
                 action="DUPLICATE_FILE_REJECTED",
                 summary=f"File {filename} rejected as duplicate of batch {existing_batch.batch_id}",
+                company_id=company_id,
                 details={"file_hash": file_hash, "original_batch_id": existing_batch.batch_id}
             )
             raise ValueError(f"Duplicate file detected. This file was previously imported in batch '{existing_batch.batch_id}'.")
 
+        # Resolve company bank ledger
+        bank_ledger = (
+            self.db.query(LedgerAccount)
+            .join(AccountGroup, AccountGroup.id == LedgerAccount.group_id)
+            .filter(
+                LedgerAccount.company_id == company_id,
+                AccountGroup.name.in_(("Bank Accounts", "Bank OD A/c"))
+            )
+            .first()
+        )
+        if not bank_ledger:
+            bank_ledger = self.db.query(LedgerAccount).filter(
+                LedgerAccount.company_id == company_id,
+                LedgerAccount.name.ilike("%HDFC%")
+            ).first()
+        if not bank_ledger:
+            bank_ledger = self.db.query(LedgerAccount).filter(
+                LedgerAccount.company_id == company_id
+            ).first()
+        bank_ledger_id = bank_ledger.id if bank_ledger else 1
+
         # 2. Create batch record
         batch_id_str = f"BATCH-{uuid.uuid4().hex[:8].upper()}"
         batch = ImportBatch(
+            company_id=company_id,
+            fy_id=fy_id,
             batch_id=batch_id_str,
             filename=filename,
             file_path=file_path,
@@ -59,6 +89,7 @@ class WorkflowService:
         self.audit_repo.log(
             action="BATCH_UPLOADED",
             summary=f"Batch {batch_id_str} created for file {filename}",
+            company_id=company_id,
             batch_id=batch.id
         )
 
@@ -69,7 +100,7 @@ class WorkflowService:
             batch.parsed_rows = len(valid_rows)
             batch.failed_rows = len(error_rows)
 
-            # Available ledgers from Tally master sync
+            # Available ledgers from master
             ledgers = [l.name for l in self.ledger_repo.list_all()]
             if not ledgers:
                 sync_list, _ = self.tally_client.sync_ledgers_from_tally()
@@ -79,7 +110,9 @@ class WorkflowService:
 
             for row_data in valid_rows:
                 tx = BankTransaction(
+                    company_id=company_id,
                     batch_id=batch.id,
+                    bank_ledger_id=bank_ledger_id,
                     source_row_index=row_data["source_row_index"],
                     transaction_date=row_data["transaction_date"],
                     value_date=row_data.get("value_date"),
@@ -104,6 +137,7 @@ class WorkflowService:
                 )
 
                 classification = TransactionClassification(
+                    company_id=company_id,
                     transaction_id=tx.id,
                     model_name="rule_fallback_engine" if is_fallback else self.llm_service.model,
                     transaction_type=ai_prop.transaction_type,
@@ -143,6 +177,7 @@ class WorkflowService:
             self.audit_repo.log(
                 action="BATCH_PROCESSED",
                 summary=f"Batch {batch_id_str} completed with {batch.parsed_rows} parsed, {batch.failed_rows} failed rows.",
+                company_id=company_id,
                 batch_id=batch.id
             )
             return batch
@@ -154,6 +189,7 @@ class WorkflowService:
             self.audit_repo.log(
                 action="BATCH_FAILED",
                 summary=f"Batch {batch_id_str} failed: {str(e)}",
+                company_id=company_id,
                 batch_id=batch.id
             )
             raise
@@ -167,6 +203,7 @@ class WorkflowService:
             raise ValueError(f"Transaction status '{tx.status}' is not eligible for clarification.")
 
         review = HumanReview(
+            company_id=tx.company_id,
             transaction_id=tx.id,
             reviewer_user="finance_user",
             corrected_transaction_type=req.corrected_transaction_type,
@@ -201,6 +238,7 @@ class WorkflowService:
         self.audit_repo.log(
             action="TRANSACTION_CLARIFIED",
             summary=f"Transaction #{tx.id} clarified with ledger '{req.selected_ledger}'. New status: {tx.status}",
+            company_id=tx.company_id,
             transaction_id=tx.id,
             previous_status=prev_status,
             new_status=tx.status,
@@ -240,6 +278,7 @@ class WorkflowService:
 
         # 1. Record explicit approval
         approval = ApprovalRecord(
+            company_id=tx.company_id,
             transaction_id=tx.id,
             approver_user=req.approver_user,
             voucher_type=voucher_type,
@@ -270,6 +309,7 @@ class WorkflowService:
 
         # 4. Durable TallySubmission record for idempotency
         submission = TallySubmission(
+            company_id=tx.company_id,
             transaction_id=tx.id,
             company_name=self.tally_client.company,
             voucher_type=voucher_type,
@@ -295,9 +335,18 @@ class WorkflowService:
             self.tx_repo.update(tx)
             self.db.commit()
 
+            # Record and post double-entry voucher in Day Book & General Ledger
+            voucher = self.create_book_voucher_for_transaction(
+                tx=tx,
+                target_ledger=target_ledger,
+                voucher_type=voucher_type,
+                created_by=req.approver_user or "SYSTEM"
+            )
+
             self.audit_repo.log(
                 action="TALLY_VOUCHER_POSTED",
-                summary=f"Transaction #{tx.id} successfully posted to Tally Prime (GUID: {tally_res.get('guid')})",
+                summary=f"Transaction #{tx.id} successfully posted to Tally Prime (GUID: {tally_res.get('guid')}, Voucher #{getattr(voucher, 'voucher_number', None)})",
+                company_id=tx.company_id,
                 transaction_id=tx.id,
                 previous_status=prev_status,
                 new_status=tx.status,
@@ -314,6 +363,7 @@ class WorkflowService:
             self.audit_repo.log(
                 action="TALLY_POSTING_FAILED",
                 summary=f"Failed to post Transaction #{tx.id} to Tally: {tally_res.get('message')}",
+                company_id=tx.company_id,
                 transaction_id=tx.id,
                 previous_status=prev_status,
                 new_status=tx.status,
@@ -335,6 +385,7 @@ class WorkflowService:
         self.audit_repo.log(
             action="TRANSACTION_SKIPPED",
             summary=f"Transaction #{tx.id} skipped by user. Reason: {reason}",
+            company_id=tx.company_id,
             transaction_id=tx.id,
             previous_status=prev_status,
             new_status=tx.status
@@ -353,9 +404,233 @@ class WorkflowService:
         self.audit_repo.log(
             action="TRANSACTION_RESET_RETRY",
             summary=f"Transaction #{tx.id} reset to PENDING_APPROVAL for retry.",
+            company_id=tx.company_id,
             transaction_id=tx.id,
             previous_status=prev_status,
             new_status=tx.status
         )
         return tx
+
+    def create_book_voucher_for_transaction(self, tx: BankTransaction, target_ledger: str, voucher_type: str, created_by: str = "SYSTEM") -> Optional[Any]:
+        """Creates and posts double-entry Voucher & General Ledger entries for a bank transaction."""
+        from services.voucher_service import VoucherService
+        try:
+            # 1. Resolve target ledger account
+            target_acc = self.db.query(LedgerAccount).filter(
+                LedgerAccount.company_id == tx.company_id,
+                LedgerAccount.name == target_ledger
+            ).first()
+            if not target_acc:
+                target_acc = self.db.query(LedgerAccount).filter(
+                    LedgerAccount.company_id == tx.company_id,
+                    func.lower(LedgerAccount.name) == target_ledger.lower()
+                ).first()
+
+            if not target_acc:
+                default_group = self.db.query(AccountGroup).filter(
+                    AccountGroup.name == ("Direct Expenses" if (tx.debit_amount or 0) > 0 else "Sales Accounts")
+                ).first()
+                target_acc = LedgerAccount(
+                    company_id=tx.company_id,
+                    group_id=default_group.id if default_group else 1,
+                    name=target_ledger,
+                    opening_balance=Decimal("0.00"),
+                    current_balance=Decimal("0.00"),
+                    is_active=True
+                )
+                self.db.add(target_acc)
+                self.db.flush()
+
+            bank_ledger_id = tx.bank_ledger_id or 1
+
+            # Prevent Debit and Credit having the identical ledger account
+            if target_acc.id == bank_ledger_id:
+                narration_lower = (tx.narration or "").lower()
+                if any(w in narration_lower for w in ["cash", "atm", "wdl"]):
+                    cash_acc = self.db.query(LedgerAccount).filter(
+                        LedgerAccount.company_id == tx.company_id,
+                        LedgerAccount.name.ilike("%cash%")
+                    ).first()
+                    if cash_acc:
+                        target_acc = cash_acc
+                        voucher_type = "Contra"
+                elif any(w in narration_lower for w in ["sms", "chg", "charge", "fee"]):
+                    chg_acc = self.db.query(LedgerAccount).filter(
+                        LedgerAccount.company_id == tx.company_id,
+                        LedgerAccount.name.ilike("%bank charge%")
+                    ).first()
+                    if chg_acc:
+                        target_acc = chg_acc
+                        voucher_type = "Payment"
+
+            # Double-entry lines:
+            # If Bank Debit (Payment/Expense): Target Dr, Bank Cr
+            # If Bank Credit (Deposit/Receipt): Bank Dr, Target Cr
+            dr_amt = Decimal(str(tx.debit_amount or 0))
+            cr_amt = Decimal(str(tx.credit_amount or 0))
+            if dr_amt > 0:
+                lines_data = [
+                    {"ledger_id": target_acc.id, "debit_amount": dr_amt, "credit_amount": Decimal("0.00"), "narration": tx.narration},
+                    {"ledger_id": bank_ledger_id, "debit_amount": Decimal("0.00"), "credit_amount": dr_amt, "narration": tx.narration}
+                ]
+            else:
+                lines_data = [
+                    {"ledger_id": bank_ledger_id, "debit_amount": cr_amt, "credit_amount": Decimal("0.00"), "narration": tx.narration},
+                    {"ledger_id": target_acc.id, "debit_amount": Decimal("0.00"), "credit_amount": cr_amt, "narration": tx.narration}
+                ]
+
+            voucher = VoucherService.create_voucher(
+                db=self.db,
+                company_id=tx.company_id,
+                voucher_type=voucher_type,
+                voucher_date=tx.transaction_date,
+                narration=tx.narration,
+                lines_data=lines_data,
+                bank_transaction_id=tx.id,
+                created_by=created_by,
+                auto_post=True
+            )
+            tx.matched_voucher_id = voucher.id
+            tx.reconciliation_status = "RECONCILED"
+            self.tx_repo.update(tx)
+            self.db.commit()
+            return voucher
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            print(f"[WorkflowService] Warning: Could not create book voucher for tx #{tx.id}: {e}")
+            return None
+
+
+
+    def skip_transaction(self, tx_id: int, reason: str) -> BankTransaction:
+        tx = self.tx_repo.get_by_id(tx_id)
+        if not tx:
+            raise ValueError(f"Transaction ID {tx_id} not found.")
+
+        prev_status = tx.status
+        tx.is_skipped = True
+        tx.skip_reason = reason
+        tx.status = TransactionStatus.SKIPPED.value
+        self.tx_repo.update(tx)
+
+        self.audit_repo.log(
+            action="TRANSACTION_SKIPPED",
+            summary=f"Transaction #{tx.id} skipped by user. Reason: {reason}",
+            company_id=tx.company_id,
+            transaction_id=tx.id,
+            previous_status=prev_status,
+            new_status=tx.status
+        )
+        return tx
+
+    def retry_transaction(self, tx_id: int) -> BankTransaction:
+        tx = self.tx_repo.get_by_id(tx_id)
+        if not tx:
+            raise ValueError(f"Transaction ID {tx_id} not found.")
+
+        prev_status = tx.status
+        tx.status = TransactionStatus.PENDING_APPROVAL.value
+        self.tx_repo.update(tx)
+
+        self.audit_repo.log(
+            action="TRANSACTION_RESET_RETRY",
+            summary=f"Transaction #{tx.id} reset to PENDING_APPROVAL for retry.",
+            company_id=tx.company_id,
+            transaction_id=tx.id,
+            previous_status=prev_status,
+            new_status=tx.status
+        )
+        return tx
+
+    def create_book_voucher_for_transaction(self, tx: BankTransaction, target_ledger: str, voucher_type: str, created_by: str = "SYSTEM") -> Optional[Any]:
+        """Creates and posts double-entry Voucher & General Ledger entries for a bank transaction."""
+        from services.voucher_service import VoucherService
+        try:
+            # 1. Resolve target ledger account
+            target_acc = self.db.query(LedgerAccount).filter(
+                LedgerAccount.company_id == tx.company_id,
+                LedgerAccount.name == target_ledger
+            ).first()
+            if not target_acc:
+                target_acc = self.db.query(LedgerAccount).filter(
+                    LedgerAccount.company_id == tx.company_id,
+                    func.lower(LedgerAccount.name) == target_ledger.lower()
+                ).first()
+
+            if not target_acc:
+                default_group = self.db.query(AccountGroup).filter(
+                    AccountGroup.name == ("Direct Expenses" if (tx.debit_amount or 0) > 0 else "Sales Accounts")
+                ).first()
+                target_acc = LedgerAccount(
+                    company_id=tx.company_id,
+                    group_id=default_group.id if default_group else 1,
+                    name=target_ledger,
+                    opening_balance=Decimal("0.00"),
+                    current_balance=Decimal("0.00"),
+                    is_active=True
+                )
+                self.db.add(target_acc)
+                self.db.flush()
+
+            bank_ledger_id = tx.bank_ledger_id or 1
+
+            # Prevent Debit and Credit having the identical ledger account
+            if target_acc.id == bank_ledger_id:
+                narration_lower = (tx.narration or "").lower()
+                if any(w in narration_lower for w in ["cash", "atm", "wdl"]):
+                    cash_acc = self.db.query(LedgerAccount).filter(
+                        LedgerAccount.company_id == tx.company_id,
+                        LedgerAccount.name.ilike("%cash%")
+                    ).first()
+                    if cash_acc:
+                        target_acc = cash_acc
+                        voucher_type = "Contra"
+                elif any(w in narration_lower for w in ["sms", "chg", "charge", "fee"]):
+                    chg_acc = self.db.query(LedgerAccount).filter(
+                        LedgerAccount.company_id == tx.company_id,
+                        LedgerAccount.name.ilike("%bank charge%")
+                    ).first()
+                    if chg_acc:
+                        target_acc = chg_acc
+                        voucher_type = "Payment"
+
+            # Double-entry lines:
+            # If Bank Debit (Payment/Expense): Target Dr, Bank Cr
+            # If Bank Credit (Deposit/Receipt): Bank Dr, Target Cr
+            dr_amt = Decimal(str(tx.debit_amount or 0))
+            cr_amt = Decimal(str(tx.credit_amount or 0))
+            if dr_amt > 0:
+                lines_data = [
+                    {"ledger_id": target_acc.id, "debit_amount": dr_amt, "credit_amount": Decimal("0.00"), "narration": tx.narration},
+                    {"ledger_id": bank_ledger_id, "debit_amount": Decimal("0.00"), "credit_amount": dr_amt, "narration": tx.narration}
+                ]
+            else:
+                lines_data = [
+                    {"ledger_id": bank_ledger_id, "debit_amount": cr_amt, "credit_amount": Decimal("0.00"), "narration": tx.narration},
+                    {"ledger_id": target_acc.id, "debit_amount": Decimal("0.00"), "credit_amount": cr_amt, "narration": tx.narration}
+                ]
+
+            voucher = VoucherService.create_voucher(
+                db=self.db,
+                company_id=tx.company_id,
+                voucher_type=voucher_type,
+                voucher_date=tx.transaction_date,
+                narration=tx.narration,
+                lines_data=lines_data,
+                bank_transaction_id=tx.id,
+                created_by=created_by,
+                auto_post=True
+            )
+            tx.matched_voucher_id = voucher.id
+            tx.reconciliation_status = "RECONCILED"
+            self.tx_repo.update(tx)
+            self.db.commit()
+            return voucher
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            print(f"[WorkflowService] Warning: Could not create book voucher for tx #{tx.id}: {e}")
+            return None
+
 

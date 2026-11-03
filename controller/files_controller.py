@@ -46,7 +46,17 @@ def upload_bank_statement():
 
             destination_path = os.path.join(config.INPUT_DIR, filename)
             try:
-                uploaded_file.save(destination_path)
+                try:
+                    uploaded_file.save(destination_path)
+                except PermissionError:
+                    # Fallback if original file is locked (e.g. open in Excel)
+                    import time
+                    name_part, ext_part = os.path.splitext(filename)
+                    alt_filename = f"{name_part}_{int(time.time())}{ext_part}"
+                    destination_path = os.path.join(config.INPUT_DIR, alt_filename)
+                    uploaded_file.save(destination_path)
+                    filename = alt_filename
+
                 batch = workflow.ingest_excel_file(destination_path, filename)
                 batch_dict = ImportBatchOut.model_validate(batch).model_dump(mode="json")
                 successful_batches.append(batch_dict)

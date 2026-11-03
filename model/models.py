@@ -159,7 +159,7 @@ class FinancialYear(Base):
     fy_code = Column(String(32), nullable=False)
     start_date = Column(Date, nullable=False)
     end_date = Column(Date, nullable=False)
-    is_current = Column(Boolean, default=True, nullable=True)
+    is_current = Column(Integer, nullable=True, default=None)
     is_closed = Column(Boolean, default=False, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 

@@ -10,7 +10,8 @@ from helper.tenant import resolve_tenant_context
 from services.voucher_service import VoucherService
 from model.models import (
     Voucher, VoucherLine, BankTransaction, LedgerAccount, 
-    VoucherStatus, VoucherType, GeneralLedger, AccountGroup
+    VoucherStatus, VoucherType, GeneralLedger, AccountGroup,
+    TransactionStatus
 )
 from utils.logger import logger
 
@@ -19,8 +20,29 @@ def list_vouchers():
     """Lists double-entry vouchers with pagination, type, and status filtering."""
     db = SessionLocal()
     try:
-        company_id, fy_id = resolve_tenant_context(db)
+        company_id, _ = resolve_tenant_context(db)
         repo = VoucherRepository(db)
+
+        # Auto-sync any PROCESSED transactions that don't have a voucher created yet
+        unlinked_txs = db.query(BankTransaction).filter(
+            BankTransaction.company_id == company_id,
+            BankTransaction.status == TransactionStatus.PROCESSED.value,
+            BankTransaction.matched_voucher_id.is_(None)
+        ).all()
+        if unlinked_txs:
+            from helper.workflow_service import WorkflowService
+            workflow = WorkflowService(db)
+            for utx in unlinked_txs:
+                tgt = None
+                vtype = "Payment" if (utx.debit_amount or 0) > 0 else "Receipt"
+                if utx.reviews:
+                    tgt = utx.reviews[-1].selected_ledger
+                    vtype = utx.reviews[-1].corrected_voucher_type or vtype
+                elif utx.classification:
+                    tgt = utx.classification.suggested_ledger
+                    vtype = utx.classification.suggested_voucher_type or vtype
+                if tgt:
+                    workflow.create_book_voucher_for_transaction(utx, tgt, vtype, "SYSTEM")
 
         page = int(request.args.get("page", 1))
         limit = min(int(request.args.get("limit", 20)), 100)
@@ -28,10 +50,11 @@ def list_vouchers():
         voucher_type = request.args.get("voucher_type")
         status = request.args.get("status")
         search = request.args.get("search")
+        filter_fy_id = int(request.args.get("fy_id")) if request.args.get("fy_id") else None
 
         vouchers, total = repo.list_vouchers(
             company_id=company_id,
-            fy_id=fy_id,
+            fy_id=filter_fy_id,
             voucher_type=voucher_type,
             status=status,
             search=search,
@@ -330,6 +353,11 @@ def generate_voucher_from_transaction(tx_id: int):
             created_by="AUTO_PROCESSOR",
             auto_post=True
         )
+
+        tx.matched_voucher_id = voucher.id
+        tx.reconciliation_status = "RECONCILED"
+        tx.clearance_date = tx.transaction_date
+        tx.status = TransactionStatus.PROCESSED.value
         db.commit()
 
         return jsonify({

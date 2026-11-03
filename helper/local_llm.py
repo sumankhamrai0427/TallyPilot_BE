@@ -215,7 +215,7 @@ Respond ONLY with a valid JSON object matching this schema:
         default_type = "supplier_payment" if is_debit else "customer_receipt"
 
         # Check bank charges
-        if any(w in text for w in ["chg", "charge", "charges", "annual fee", "sms chg", "min bal", "gst"]):
+        if any(w in text for w in ["chg", "charge", "charges", "annual fee", "sms", "sms chg", "min bal", "gst"]):
             ledger = self._find_ledger_matching(["bank charges", "indirect expenses"], available_ledgers)
             return AICorrectionProposal(
                 transaction_type="bank_charges",
@@ -332,8 +332,16 @@ Respond ONLY with a valid JSON object matching this schema:
         return ledgers[0] if ledgers else None
 
     def _find_other_bank(self, text: str, ledgers: List[str]) -> Optional[str]:
+        # If it's a cash withdrawal or deposit, match cash account first
+        if any(w in text for w in ["atm", "cash", "wdl", "dep"]):
+            for l in ledgers:
+                if "cash" in l.lower():
+                    return l
+            return "Cash"
+
+        # Inter-bank transfer: find other bank
         for l in ledgers:
-            if "bank" in l.lower() or "cash" in l.lower():
+            if "bank" in l.lower():
                 first_word = l.split()[0].lower()
                 if first_word in text:
                     return l

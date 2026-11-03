@@ -1,7 +1,7 @@
 """Double-Entry Accounting & Voucher Posting Engine.
 Implements atomic voucher posting, debit/credit balancing guards, and General Ledger posting.
 """
-from datetime import datetime
+from datetime import datetime, date
 from decimal import Decimal
 from typing import List, Optional
 from sqlalchemy.orm import Session
@@ -33,7 +33,21 @@ class VoucherService:
             ).first()
 
         if not fy:
-            raise ValueError(f"No active or matching Financial Year found for company_id={company_id}")
+            # Auto-create FY for this date
+            year = voucher_date.year if voucher_date.month >= 4 else voucher_date.year - 1
+            start_date = date(year, 4, 1)
+            end_date = date(year + 1, 3, 31)
+            fy_code = f"FY-{year}-{str(year + 1)[-2:]}"
+            fy = FinancialYear(
+                company_id=company_id,
+                fy_code=fy_code,
+                start_date=start_date,
+                end_date=end_date,
+                is_current=True,
+                is_closed=False
+            )
+            db.add(fy)
+            db.flush()
         return fy
 
     @staticmethod
@@ -60,7 +74,19 @@ class VoucherService:
             Voucher.fy_id == fy_id,
             Voucher.voucher_type == voucher_type
         ).scalar() or 0
-        return f"{prefix}-{count + 1:04d}"
+
+        # Guarantee unique voucher number across company and FY
+        candidate_num = count + 1
+        while True:
+            v_num = f"{prefix}-{candidate_num:04d}"
+            exists = db.query(Voucher.id).filter(
+                Voucher.company_id == company_id,
+                Voucher.fy_id == fy_id,
+                Voucher.voucher_number == v_num
+            ).first()
+            if not exists:
+                return v_num
+            candidate_num += 1
 
     @classmethod
     def create_voucher(
@@ -79,9 +105,26 @@ class VoucherService:
         """Creates a double-entry voucher with balanced lines. Optionally posts immediately."""
         fy = cls.get_or_resolve_financial_year(db, company_id, voucher_date)
 
-        # Validate that date is within financial year
+        # Validate that date is within financial year, or resolve exact FY
         if voucher_date < fy.start_date or voucher_date > fy.end_date:
-            raise ValueError(f"Voucher date {voucher_date} is outside Financial Year ({fy.start_date} to {fy.end_date})")
+            exact_fy = db.query(FinancialYear).filter(
+                FinancialYear.company_id == company_id,
+                FinancialYear.start_date <= voucher_date,
+                FinancialYear.end_date >= voucher_date
+            ).first()
+            if not exact_fy:
+                year = voucher_date.year if voucher_date.month >= 4 else voucher_date.year - 1
+                exact_fy = FinancialYear(
+                    company_id=company_id,
+                    fy_code=f"FY-{year}-{str(year + 1)[-2:]}",
+                    start_date=date(year, 4, 1),
+                    end_date=date(year + 1, 3, 31),
+                    is_current=None,
+                    is_closed=False
+                )
+                db.add(exact_fy)
+                db.flush()
+            fy = exact_fy
 
         # Validate Debit == Credit
         total_debit = Decimal("0.00")
