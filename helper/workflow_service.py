@@ -100,6 +100,19 @@ class WorkflowService:
             batch.parsed_rows = len(valid_rows)
             batch.failed_rows = len(error_rows)
 
+            total_valid = len(valid_rows)
+            auto_posted_count = 0
+            clarification_count = 0
+
+            print("\n" + "=" * 78, flush=True)
+            print("🚀 [TallyPilot Ingestion Pipeline] Starting Bank Statement Processing", flush=True)
+            print(f"📁 Statement File : {filename} ({file_size} bytes)", flush=True)
+            print(f"📦 Batch ID       : {batch_id_str}", flush=True)
+            print(f"🤖 Active LLM     : {self.llm_service.active_llm.upper()} (Model: {self.llm_service.model})", flush=True)
+            print(f"🎯 Auto Threshold : {self.llm_service.confidence_threshold * 100:.0f}% confidence", flush=True)
+            print(f"📑 Statement Rows : {total_valid} valid row(s) to process", flush=True)
+            print("=" * 78, flush=True)
+
             # Available ledgers from master
             ledgers = [l.name for l in self.ledger_repo.list_all()]
             if not ledgers:
@@ -108,7 +121,15 @@ class WorkflowService:
                     self.ledger_repo.upsert(item["name"], item["parent_group"])
                 ledgers = [l.name for l in self.ledger_repo.list_all()]
 
-            for row_data in valid_rows:
+            for idx, row_data in enumerate(valid_rows, 1):
+                debit_f = float(row_data["debit_amount"])
+                credit_f = float(row_data["credit_amount"])
+                amt_str = f"Debit ₹{debit_f:,.2f}" if debit_f > 0 else f"Credit ₹{credit_f:,.2f}"
+
+                print(f"\n[{idx}/{total_valid}] ────────────────────────────────────────────────────────", flush=True)
+                print(f"📅 Row #{row_data['source_row_index']} | Date: {row_data['transaction_date']} | {amt_str} | Ref: {row_data.get('bank_reference') or 'N/A'}", flush=True)
+                print(f"📄 Narration: \"{row_data['narration']}\"", flush=True)
+
                 tx = BankTransaction(
                     company_id=company_id,
                     batch_id=batch.id,
@@ -127,8 +148,6 @@ class WorkflowService:
                 self.tx_repo.create(tx)
 
                 # 4. Local AI Classification
-                debit_f = float(row_data["debit_amount"])
-                credit_f = float(row_data["credit_amount"])
                 ai_prop, is_fallback = self.llm_service.classify_transaction(
                     narration=row_data["narration"],
                     debit_amount=debit_f,
@@ -163,16 +182,40 @@ class WorkflowService:
 
                 # State machine transition
                 if not val_res["is_valid"] or ai_prop.requires_human_review or ai_prop.confidence < self.llm_service.confidence_threshold:
+                    clarification_count += 1
                     tx.status = TransactionStatus.NEEDS_CLARIFICATION.value
                     tx.requires_review = True
+                    self.tx_repo.update(tx)
+                    reason = "Confidence < 80%" if ai_prop.confidence < self.llm_service.confidence_threshold else "Accounting validation / human review flag"
+                    print(f"   ⚠️ [Pipeline Decision] -> NEEDS CLARIFICATION ({reason})", flush=True)
+                    print(f"      Transaction #{tx.id} queued for user review in Clarification Queue.", flush=True)
                 else:
+                    auto_posted_count += 1
                     tx.status = TransactionStatus.PENDING_APPROVAL.value
                     tx.requires_review = False
-
-                self.tx_repo.update(tx)
+                    self.tx_repo.update(tx)
+                    print(f"   🎯 [Pipeline Decision] -> HIGH CONFIDENCE ({float(ai_prop.confidence)*100:.1f}%) & VALID", flush=True)
+                    print(f"      Auto-approving & posting directly to General Ledger & Tally Prime...", flush=True)
+                    try:
+                        post_res = self.approve_and_post_transaction(
+                            tx.id,
+                            ApproveTransactionRequest(
+                                approver_user="AUTO_AI",
+                                approval_notes=f"Auto-approved & posted (Confidence: {float(ai_prop.confidence)*100:.1f}%)"
+                            )
+                        )
+                        v_num = post_res.get("voucher", {}).get("voucher_number", f"Voucher for Tx #{tx.id}")
+                        print(f"      ✅ Posted Successfully! Voucher #{v_num} created in GL.", flush=True)
+                    except Exception as auto_err:
+                        print(f"      ❌ Auto-post error for Tx #{tx.id}: {auto_err}", flush=True)
 
             batch.status = "COMPLETED"
             self.batch_repo.update(batch)
+
+            print("\n" + "=" * 78, flush=True)
+            print(f"🎉 [Batch Complete] {batch_id_str} | File: {filename}", flush=True)
+            print(f"📊 Summary: Total Processed: {total_valid} | Auto-Posted Vouchers: {auto_posted_count} | Needs Clarification: {clarification_count}", flush=True)
+            print("=" * 78 + "\n", flush=True)
 
             self.audit_repo.log(
                 action="BATCH_PROCESSED",
@@ -229,11 +272,26 @@ class WorkflowService:
         if val_res["is_valid"]:
             tx.status = TransactionStatus.PENDING_APPROVAL.value
             tx.requires_review = False
+            self.tx_repo.update(tx)
+
+            # Auto-post immediately to official Vouchers & Tally Prime
+            try:
+                self.approve_and_post_transaction(
+                    tx.id,
+                    ApproveTransactionRequest(
+                        approver_user="finance_user",
+                        approval_notes=req.reviewer_notes or "Clarified and auto-posted directly to vouchers"
+                    )
+                )
+                refreshed_tx = self.tx_repo.get_by_id(tx.id)
+                if refreshed_tx:
+                    tx = refreshed_tx
+            except Exception as auto_post_err:
+                print(f">> [WorkflowService] Auto-post after clarification error for Tx #{tx.id}: {auto_post_err}")
         else:
             tx.status = TransactionStatus.NEEDS_CLARIFICATION.value
             tx.requires_review = True
-
-        self.tx_repo.update(tx)
+            self.tx_repo.update(tx)
 
         self.audit_repo.log(
             action="TRANSACTION_CLARIFIED",

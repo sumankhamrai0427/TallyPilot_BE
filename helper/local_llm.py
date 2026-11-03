@@ -95,10 +95,13 @@ class LocalLLMService:
         """
         health = self.check_health()
         if not health["available"]:
+            print(f"   ⚠️ [LLM Offline] Provider '{self.active_llm}' is currently unavailable ({health.get('status')}).", flush=True)
+            print(f"   ⚙️ [Rule Engine] Activating Deterministic Rule-Based Fallback Engine...", flush=True)
             fallback = self._rule_based_fallback(narration, debit_amount, credit_amount, available_ledgers)
             return fallback, True
 
         prompt = self._build_prompt(narration, debit_amount, credit_amount, available_ledgers)
+        print(f"   🤖 [LLM Calling] Provider: {self.active_llm.upper()} | Model: {self.model} ...", flush=True)
         
         try:
             # 1. Mistral Cloud API
@@ -120,8 +123,11 @@ class LocalLLMService:
                     res = client.post(self.mistral_chat_url, json=payload, headers=headers)
                     if res.status_code == 200:
                         content = res.json()["choices"][0]["message"]["content"]
+                        print(f"   ✅ [LLM Response] {content.strip()}", flush=True)
                         parsed_json = json.loads(content)
                         return self._process_llm_json(parsed_json, available_ledgers)
+                    else:
+                        print(f"   ⚠️ [LLM API Error] Status {res.status_code}: {res.text}", flush=True)
 
             # 2. Mistral Local / OpenAI Compatible or Ollama endpoint
             elif self.active_llm == "mistral_local":
@@ -140,9 +146,10 @@ class LocalLLMService:
                             res = client.post(endpoint, json=chat_payload)
                             if res.status_code == 200:
                                 content = res.json()["choices"][0]["message"]["content"]
+                                print(f"   ✅ [LLM Response] {content.strip()}", flush=True)
                                 parsed_json = json.loads(re.search(r'\{.*\}', content, re.DOTALL).group(0))
                                 return self._process_llm_json(parsed_json, available_ledgers)
-                        except Exception:
+                        except Exception as e:
                             continue
 
                     # Fallback to Ollama /api/generate
@@ -157,15 +164,19 @@ class LocalLLMService:
                         res = client.post(f"{self.mistral_local_url}/api/generate", json=ollama_payload)
                         if res.status_code == 200:
                             body = res.json()
-                            parsed_json = json.loads(body.get("response", "{}"))
+                            content = body.get("response", "{}")
+                            print(f"   ✅ [LLM Response] {content.strip()}", flush=True)
+                            parsed_json = json.loads(content)
                             return self._process_llm_json(parsed_json, available_ledgers)
-                    except Exception:
+                    except Exception as e:
                         pass
 
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"   ⚠️ [LLM Exception] {e}", flush=True)
 
+        print(f"   ⚙️ [Rule Engine] Switching to Deterministic Rule-Based Fallback Engine...", flush=True)
         fallback = self._rule_based_fallback(narration, debit_amount, credit_amount, available_ledgers)
+        print(f"   💡 [Fallback Rule Result] Suggested Ledger: \"{fallback.suggested_ledger}\" | Voucher: {fallback.suggested_voucher_type.value} | Confidence: {float(fallback.confidence)*100:.1f}%", flush=True)
         return fallback, True
 
     def _process_llm_json(self, parsed_json: Dict[str, Any], available_ledgers: List[str]) -> Tuple[AICorrectionProposal, bool]:
@@ -177,6 +188,7 @@ class LocalLLMService:
             proposal.confidence = min(proposal.confidence, 0.70)
             proposal.requires_human_review = True
             proposal.ambiguity_reason = f"Original suggestion '{parsed_json.get('suggested_ledger')}' not in Tally ledgers. Closest match '{closest}' requires confirmation."
+        print(f"   💡 [LLM Suggestion] Ledger: \"{proposal.suggested_ledger}\" | Voucher: {proposal.suggested_voucher_type.value} | Confidence: {float(proposal.confidence)*100:.1f}%", flush=True)
         return proposal, False
 
     def _build_prompt(self, narration: str, debit: float, credit: float, ledgers: List[str]) -> str:
