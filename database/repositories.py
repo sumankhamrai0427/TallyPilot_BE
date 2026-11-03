@@ -89,7 +89,84 @@ class CompanyRepository:
         self.db.add(company)
         self.db.commit()
         self.db.refresh(company)
+        try:
+            self.seed_company_chart_of_accounts(company.id)
+        except Exception as seed_err:
+            print(f">> [CompanyRepository] Notice: could not seed default chart of accounts: {seed_err}")
         return company
+
+    def seed_company_chart_of_accounts(self, company_id: int):
+        """Seeds standard accounting groups and initial bank/cash ledgers for a company."""
+        standard_groups = [
+            ("Bank Accounts", "GRP-BNK", "ASSET", "DEBIT"),
+            ("Cash-in-hand", "GRP-CSH", "ASSET", "DEBIT"),
+            ("Sundry Debtors", "GRP-SDR", "ASSET", "DEBIT"),
+            ("Sundry Creditors", "GRP-SCR", "LIABILITY", "CREDIT"),
+            ("Direct Expenses", "GRP-DIR", "EXPENSE", "DEBIT"),
+            ("Indirect Expenses", "GRP-IND", "EXPENSE", "DEBIT"),
+            ("Sales Accounts", "GRP-SAL", "INCOME", "CREDIT"),
+            ("Purchase Accounts", "GRP-PUR", "EXPENSE", "DEBIT"),
+            ("Duties & Taxes", "GRP-TAX", "LIABILITY", "CREDIT"),
+            ("Capital Account", "GRP-CAP", "EQUITY", "CREDIT"),
+        ]
+
+        group_map = {}
+        for g_name, g_code, g_type, g_nature in standard_groups:
+            grp = self.db.query(AccountGroup).filter(
+                AccountGroup.company_id == company_id,
+                AccountGroup.name == g_name
+            ).first()
+            if not grp:
+                grp = AccountGroup(
+                    company_id=company_id,
+                    name=g_name,
+                    code=g_code,
+                    group_type=g_type,
+                    nature=g_nature,
+                    affects_gross_profit=(g_type in ["INCOME", "EXPENSE"] and "Direct" in g_name),
+                    is_builtin=True
+                )
+                self.db.add(grp)
+                self.db.flush()
+            group_map[g_name] = grp
+
+        # Default bank ledger
+        comp = self.get_by_id(company_id)
+        bank_name = (comp.default_bank_ledger if comp and comp.default_bank_ledger else "HDFC Bank")
+        bank_ledger = self.db.query(LedgerAccount).filter(
+            LedgerAccount.company_id == company_id,
+            LedgerAccount.name == bank_name
+        ).first()
+        if not bank_ledger and "Bank Accounts" in group_map:
+            bank_ledger = LedgerAccount(
+                company_id=company_id,
+                group_id=group_map["Bank Accounts"].id,
+                name=bank_name,
+                code="BNK-001",
+                opening_balance=Decimal("0.00"),
+                current_balance=Decimal("0.00"),
+                is_active=True
+            )
+            self.db.add(bank_ledger)
+
+        # Cash ledger
+        cash_ledger = self.db.query(LedgerAccount).filter(
+            LedgerAccount.company_id == company_id,
+            LedgerAccount.name == "Cash"
+        ).first()
+        if not cash_ledger and "Cash-in-hand" in group_map:
+            cash_ledger = LedgerAccount(
+                company_id=company_id,
+                group_id=group_map["Cash-in-hand"].id,
+                name="Cash",
+                code="CSH-001",
+                opening_balance=Decimal("0.00"),
+                current_balance=Decimal("0.00"),
+                is_active=True
+            )
+            self.db.add(cash_ledger)
+
+        self.db.commit()
 
     def update_company(self, company_id: int, data: dict) -> Optional[Company]:
         comp = self.get_by_id(company_id)
@@ -510,8 +587,11 @@ class BatchRepository:
     def get_by_batch_id_str(self, batch_id_str: str) -> Optional[ImportBatch]:
         return self.db.query(ImportBatch).filter(ImportBatch.batch_id == batch_id_str).first()
 
-    def get_by_file_hash(self, file_hash: str) -> Optional[ImportBatch]:
-        return self.db.query(ImportBatch).filter(ImportBatch.file_hash == file_hash).first()
+    def get_by_file_hash(self, file_hash: str, company_id: Optional[int] = None) -> Optional[ImportBatch]:
+        query = self.db.query(ImportBatch).filter(ImportBatch.file_hash == file_hash)
+        if company_id is not None:
+            query = query.filter(ImportBatch.company_id == company_id)
+        return query.first()
 
     def list_recent(self, company_id: Optional[int] = None, limit: int = 20) -> List[ImportBatch]:
         query = self.db.query(ImportBatch)

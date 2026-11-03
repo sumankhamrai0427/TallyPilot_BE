@@ -170,6 +170,9 @@ class BankTransactionOut(BaseModel):
     skip_reason: Optional[str]
     rejection_reason: Optional[str] = None
     reconciliation_status: str
+    matched_voucher_id: Optional[int] = None
+    voucher_number: Optional[str] = None
+    bank_ledger_name: Optional[str] = None
     created_at: datetime
     classification: Optional[TransactionClassificationOut] = None
     reviews: List[HumanReviewOut] = []

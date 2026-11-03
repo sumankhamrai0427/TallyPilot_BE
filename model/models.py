@@ -309,6 +309,15 @@ class BankTransaction(Base):
     approvals = relationship("ApprovalRecord", back_populates="transaction", cascade="all, delete-orphan")
     submissions = relationship("TallySubmission", back_populates="transaction", cascade="all, delete-orphan")
     matched_voucher = relationship("Voucher", foreign_keys=[matched_voucher_id])
+    bank_ledger = relationship("LedgerAccount", foreign_keys=[bank_ledger_id])
+
+    @property
+    def voucher_number(self):
+        return self.matched_voucher.voucher_number if self.matched_voucher else None
+
+    @property
+    def bank_ledger_name(self):
+        return self.bank_ledger.name if self.bank_ledger else "HDFC Bank"
 
     @property
     def amount(self):

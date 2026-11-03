@@ -10,6 +10,7 @@ from utils.config import config
 from helper.workflow_service import WorkflowService
 from database.repositories import BatchRepository
 from model.schemas import ImportBatchOut
+from helper.tenant import resolve_tenant_context
 
 
 def upload_bank_statement():
@@ -61,29 +62,79 @@ def upload_bank_statement():
                 batch_dict = ImportBatchOut.model_validate(batch).model_dump(mode="json")
                 successful_batches.append(batch_dict)
             except ValueError as ve:
-                failed_files.append({"filename": filename, "error": str(ve)})
+                try:
+                    db.rollback()
+                except Exception:
+                    pass
+                err_msg = str(ve)
+                is_dup = "Duplicate file detected" in err_msg
+                failed_files.append({
+                    "filename": filename,
+                    "error": err_msg,
+                    "is_duplicate": is_dup
+                })
             except Exception as e:
-                failed_files.append({"filename": filename, "error": f"Processing error: {str(e)}"})
+                try:
+                    db.rollback()
+                except Exception:
+                    pass
+                failed_files.append({"filename": filename, "error": f"Processing error: {str(e)}", "is_duplicate": False})
 
         # Backward compatibility for single file upload
         if len(uploaded_files) == 1 and len(successful_batches) == 1 and not failed_files:
-            single_res = successful_batches[0]
-            single_res["batches"] = successful_batches
-            return jsonify(single_res), 201
+            batch_copy = dict(successful_batches[0])
+            res_payload = {
+                **batch_copy,
+                "success": True,
+                "batches": [dict(batch_copy)],
+                "total_files": 1,
+                "successful_count": 1,
+                "failed_files": [],
+                "has_duplicates": False
+            }
+            return jsonify(res_payload), 201
+
+        has_duplicates = any(f.get("is_duplicate") for f in failed_files)
 
         if not successful_batches and failed_files:
+            # If failed files are duplicate files, return 200 with structured duplicate payload
+            # so the browser client doesn't log a 400 Bad Request network failure.
+            if has_duplicates:
+                return jsonify({
+                    "success": False,
+                    "is_duplicate": True,
+                    "detail": failed_files[0]["error"],
+                    "failed_files": failed_files,
+                    "batches": [],
+                    "total_files": len(uploaded_files),
+                    "successful_count": 0
+                }), 200
+
             return jsonify({
                 "detail": failed_files[0]["error"],
                 "failed_files": failed_files
             }), 400
 
         return jsonify({
+            "success": True,
             "batches": successful_batches,
             "total_files": len(uploaded_files),
             "successful_count": len(successful_batches),
-            "failed_files": failed_files
+            "failed_files": failed_files,
+            "has_duplicates": has_duplicates
         }), 201
 
+    except Exception as global_err:
+        import traceback
+        traceback.print_exc()
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        return jsonify({
+            "detail": f"Server error: {str(global_err)}",
+            "failed_files": [{"filename": "upload", "error": str(global_err), "is_duplicate": False}]
+        }), 500
     finally:
         db.close()
 
@@ -107,6 +158,10 @@ def scan_input_folder():
                 batch = workflow.ingest_excel_file(full_path, filename)
                 processed_batches.append(ImportBatchOut.model_validate(batch).model_dump(mode="json"))
             except Exception:
+                try:
+                    db.rollback()
+                except Exception:
+                    pass
                 continue
 
         return jsonify(processed_batches)
@@ -115,12 +170,13 @@ def scan_input_folder():
 
 
 def list_batches():
-    """Lists recent imported batches."""
+    """Lists recent imported batches for the active tenant company."""
     limit = request.args.get("limit", default=50, type=int)
     db = SessionLocal()
     try:
+        company_id, _ = resolve_tenant_context(db)
         repo = BatchRepository(db)
-        batches = repo.list_recent(limit=limit)
+        batches = repo.list_recent(company_id=company_id, limit=limit)
         return jsonify([ImportBatchOut.model_validate(b).model_dump() for b in batches])
     finally:
         db.close()
