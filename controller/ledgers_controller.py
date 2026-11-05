@@ -347,6 +347,13 @@ def list_bank_ledgers():
         company_id, _ = resolve_tenant_context(db)
         repo = LedgerRepository(db)
         banks = repo.list_bank_ledgers(company_id=company_id)
+        if not banks and company_id:
+            # Self-heal chart of accounts if ledgers or groups were cleared
+            from database.repositories import CompanyRepository
+            comp_repo = CompanyRepository(db)
+            comp_repo.seed_company_chart_of_accounts(company_id)
+            banks = repo.list_bank_ledgers(company_id=company_id)
+
         return jsonify([
             {
                 "id": b.id,

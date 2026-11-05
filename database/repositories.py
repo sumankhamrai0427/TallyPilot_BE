@@ -262,6 +262,10 @@ class CompanyRepository:
             comp.is_active = bool(data["is_active"])
         self.db.commit()
         self.db.refresh(comp)
+        try:
+            self.seed_company_chart_of_accounts(comp.id)
+        except Exception as seed_err:
+            print(f">> [CompanyRepository] Notice on update: {seed_err}")
         return comp
 
     def create_financial_year(self, company_id: int, data: dict) -> FinancialYear:
