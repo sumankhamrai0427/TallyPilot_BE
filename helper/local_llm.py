@@ -228,12 +228,145 @@ class LocalLLMService:
             if not proposal.suggested_group_name:
                 proposal.suggested_group_name = "Sundry Debtors" if credit > 0 else "Indirect Expenses"
 
+        # -------------------------------------------------------------
+        # STRICT GUARDRAIL: A ledger name must NEVER be an Account Group name!
+        # E.g. "Sundry Creditors" or "Sundry Debtors" is a group, NOT a ledger.
+        # -------------------------------------------------------------
+        generic_group_names = {
+            "sundry creditors", "sundry debtors", "direct expenses", "indirect expenses",
+            "bank accounts", "cash-in-hand", "sales accounts", "purchase accounts",
+            "duties & taxes", "capital account"
+        }
+        if available_groups:
+            generic_group_names.update(g.strip().lower() for g in available_groups)
+
+        sug_led_raw = (proposal.suggested_ledger or "").strip()
+        if sug_led_raw.lower() in generic_group_names:
+            print(f"   ⚠️ [LLM Hallucination Intercepted] LLM proposed group name '{sug_led_raw}' as suggested_ledger. Resolving real entity...", flush=True)
+            narr_low = narration.lower()
+            
+            # Check for Contra first
+            if any(w in narr_low for w in ["atm cash", "cash wdl", "cash withdrawal", "cash dep", "cash deposit", "cdm"]):
+                proposal.suggested_voucher_type = VoucherType.CONTRA
+                proposal.suggested_ledger = "Cash"
+                proposal.suggested_group_name = "Cash-in-hand"
+                proposal.transaction_type = "contra_transfer"
+                proposal.confidence = 0.95
+                proposal.requires_human_review = False
+            # Check for common utilities / expenses
+            elif "insurance" in narr_low:
+                proposal.suggested_ledger = "Insurance Premium"
+                proposal.suggested_group_name = "Indirect Expenses"
+                proposal.transaction_type = "office_expense"
+            elif "electricity" in narr_low or "power" in narr_low or "bill" in narr_low and "unit" in narr_low:
+                proposal.suggested_ledger = "Electricity Expenses"
+                proposal.suggested_group_name = "Indirect Expenses"
+                proposal.transaction_type = "utility_expense"
+            elif "rent" in narr_low:
+                proposal.suggested_ledger = "Office Rent"
+                proposal.suggested_group_name = "Indirect Expenses"
+                proposal.transaction_type = "rent_expense"
+            elif "salary" in narr_low:
+                proposal.suggested_ledger = "Salary Expenses"
+                proposal.suggested_group_name = "Indirect Expenses"
+                proposal.transaction_type = "office_expense"
+            elif "fuel" in narr_low or "petrol" in narr_low or "diesel" in narr_low or "delivery travel" in narr_low:
+                proposal.suggested_ledger = "Travelling & Conveyance"
+                proposal.suggested_group_name = "Indirect Expenses"
+                proposal.transaction_type = "travel_expense"
+            elif "software" in narr_low or "cloud" in narr_low or "subscription" in narr_low:
+                proposal.suggested_ledger = "Software & Subscription Expenses"
+                proposal.suggested_group_name = "Indirect Expenses"
+                proposal.transaction_type = "office_expense"
+            elif "stationery" in narr_low or "prints" in narr_low or "printing" in narr_low:
+                proposal.suggested_ledger = "Printing & Stationery"
+                proposal.suggested_group_name = "Indirect Expenses"
+                proposal.transaction_type = "office_expense"
+            elif any(w in narr_low for w in ["chg", "charge", "charges", "sms", "maintenance"]):
+                proposal.suggested_ledger = "Bank Charges"
+                proposal.suggested_group_name = "Indirect Expenses"
+                proposal.transaction_type = "bank_charges"
+            elif "gst" in narr_low or "tax" in narr_low:
+                proposal.suggested_ledger = "GST Tax Liability"
+                proposal.suggested_group_name = "Duties & Taxes"
+                proposal.transaction_type = "office_expense"
+            elif "counter sale" in narr_low or "pos" in narr_low:
+                proposal.suggested_ledger = "Counter Sales"
+                proposal.suggested_group_name = "Sales Accounts"
+                proposal.transaction_type = "customer_receipt"
+            else:
+                # Extract clean entity name from narration (e.g. "Eastern Office Mart", "Metro Packers")
+                extracted = self._extract_clean_party_name(narration)
+                if extracted and extracted.lower() not in generic_group_names:
+                    proposal.suggested_ledger = extracted
+                    if debit > 0:
+                        proposal.suggested_group_name = "Sundry Creditors"
+                        proposal.transaction_type = "supplier_payment"
+                    else:
+                        proposal.suggested_group_name = "Sundry Debtors"
+                        proposal.transaction_type = "customer_receipt"
+                else:
+                    proposal.suggested_ledger = "Suspense Account"
+                    proposal.suggested_group_name = "Indirect Expenses"
+                    proposal.confidence = 0.50
+                    proposal.requires_human_review = True
+                    proposal.ambiguity_reason = "Unresolved entity from narration. Assigned to Suspense Account for human review."
+
         matched = None
         if proposal.suggested_ledger:
             for l in available_ledgers:
                 if l.strip().lower() == proposal.suggested_ledger.strip().lower():
                     matched = l
                     break
+
+        # Anti-Hallucination Guardrail:
+        # If the LLM matched an existing ledger (like "Northstar Distributors" or "Punjab National Bank"),
+        # verify that the party name or cash is ACTUALLY present in the narration!
+        # Do NOT allow the LLM to map a mobile bill, salary, software, or insurance to an unrelated existing vendor!
+        if matched and matched.lower() not in ["cash", "suspense account"]:
+            tokens = [t.lower() for t in re.split(r'[\s&,.-]+', matched) if len(t) > 3 and t.lower() not in ["ltd", "limited", "pvt", "private", "corp", "inc", "account", "bank", "distributors", "enterprises", "traders", "services"]]
+            narr_lower = narration.lower()
+            if tokens and not any(t in narr_lower for t in tokens):
+                print(f"   ⚠️ [Anti-Hallucination] LLM incorrectly mapped narration '{narration}' to unrelated existing ledger '{matched}'. Overriding with narration content...", flush=True)
+                matched = None
+                proposal.requires_new_ledger = True
+                
+                # Re-resolve ledger based on actual narration content
+                if "insurance" in narr_lower:
+                    proposal.suggested_ledger = "Insurance Premium"
+                    proposal.suggested_group_name = "Indirect Expenses"
+                    proposal.transaction_type = "office_expense"
+                elif "mobile" in narr_lower or "internet" in narr_lower or "telecom" in narr_lower:
+                    proposal.suggested_ledger = "Telephone & Internet Charges"
+                    proposal.suggested_group_name = "Indirect Expenses"
+                    proposal.transaction_type = "utility_expense"
+                elif "salary" in narr_lower:
+                    proposal.suggested_ledger = "Salary Expenses"
+                    proposal.suggested_group_name = "Indirect Expenses"
+                    proposal.transaction_type = "office_expense"
+                elif "software" in narr_lower or "cloud" in narr_lower or "subscription" in narr_lower:
+                    proposal.suggested_ledger = "Software & Subscription Expenses"
+                    proposal.suggested_group_name = "Indirect Expenses"
+                    proposal.transaction_type = "office_expense"
+                elif "counter sale" in narr_lower or "pos" in narr_lower:
+                    proposal.suggested_ledger = "Counter Sales"
+                    proposal.suggested_group_name = "Sales Accounts"
+                    proposal.transaction_type = "customer_receipt"
+                elif any(k in narr_lower for k in ["advance for order", "customer advance", "customer order", "refund received", "invoice si"]):
+                    extracted = self._extract_clean_party_name(narration)
+                    proposal.suggested_ledger = extracted or "Trade Customer"
+                    proposal.suggested_group_name = "Sundry Debtors"
+                    proposal.transaction_type = "customer_receipt"
+                else:
+                    extracted = self._extract_clean_party_name(narration)
+                    if extracted:
+                        proposal.suggested_ledger = extracted
+                        proposal.suggested_group_name = "Sundry Creditors" if debit > 0 else "Sundry Debtors"
+                    else:
+                        proposal.suggested_ledger = "Suspense Account"
+                        proposal.suggested_group_name = "Indirect Expenses"
+                        proposal.confidence = 0.50
+                        proposal.requires_human_review = True
 
         if matched:
             proposal.suggested_ledger = matched
@@ -255,7 +388,16 @@ class LocalLLMService:
 
     def _build_prompt(self, narration: str, debit: float, credit: float, ledgers: List[str], available_groups: Optional[List[str]] = None) -> str:
         direction = f"Withdrawal/Debit (Outgoing payment): {debit}" if debit > 0 else f"Deposit/Credit (Incoming receipt): {credit}"
-        ledgers_str = ", ".join(f'"{l}"' for l in ledgers[:50])
+        
+        # Filter out any generic group names that might have accidentally crept into ledgers list
+        generic_group_names = {
+            "sundry creditors", "sundry debtors", "direct expenses", "indirect expenses",
+            "bank accounts", "cash-in-hand", "sales accounts", "purchase accounts",
+            "duties & taxes", "capital account"
+        }
+        clean_ledgers = [l for l in ledgers if l.strip().lower() not in generic_group_names]
+        ledgers_str = ", ".join(f'"{l}"' for l in clean_ledgers[:50])
+
         groups_list = available_groups or [
             "Sundry Debtors", "Sundry Creditors", "Indirect Expenses", "Direct Expenses",
             "Sales Accounts", "Purchase Accounts", "Indirect Incomes", "Duties & Taxes",
@@ -270,29 +412,53 @@ Bank Narration: "{narration}"
 Existing Company Ledgers in Database: [{ledgers_str}]
 Available Account Groups in Master Database: [{groups_str}]
 
-Classification & Entity Grounding Rules:
-1. EXISTING LEDGERS: If the narration clearly matches an EXISTING ledger (e.g. Office Rent, Electricity, Bank Charges, or an existing Customer/Supplier), use that exact ledger with confidence >= 0.88 and requires_new_ledger = false.
-2. DYNAMIC GROUP & ENTITY RECOGNITION:
-   - For incoming money (Credit/Receipt):
-     * If from a customer, buyer, or trade invoice -> choose "Sundry Debtors".
-     * If bank interest, savings interest, or dividend -> choose "Indirect Incomes".
-     * If tax/GST refund or subsidy -> choose "Duties & Taxes" or "Current Assets".
-     * If cash sales, pos, counter retail -> choose "Sales Accounts".
-   - For outgoing money (Debit/Payment):
-     * If commercial vendor/supplier/contractor -> choose "Sundry Creditors".
-     * If operational expenses (rent, electricity, amc, pantry, telecom, freight) -> choose "Indirect Expenses" or "Direct Expenses".
-   - Select suggested_group_name strictly from the Available Account Groups list above.
-3. CONTRA: For ATM cash withdrawals, cash deposits, or inter-bank self-transfers, classify as suggested_voucher_type = "Contra", suggested_ledger = "Cash" (or other bank), confidence = 0.92, requires_human_review = false.
-4. GENUINELY AMBIGUOUS / CRYPTIC: If the narration is completely obscure, unverified, cryptic, or suspicious (e.g. "UPI/849204910294/UNRECOGNIZED-STORE", obscure personal string, or unexplained debit):
+CRITICAL ACCOUNTING PRINCIPLE & DISTINCTION:
+- An Account Group (such as "Sundry Creditors", "Sundry Debtors", "Indirect Expenses", "Direct Expenses", "Sales Accounts") is a CATEGORY/PARENT, NEVER A LEDGER!
+- YOU MUST NEVER OUTPUT AN ACCOUNT GROUP NAME AS "suggested_ledger"! "suggested_ledger" MUST ALWAYS BE A SPECIFIC ENTITY NAME OR EXPENSE ACCOUNT NAME!
+
+SPECIFIC EXTRACTION RULES:
+1. COMMERCIAL VENDOR / SUPPLIER PAYMENTS (e.g. "NEFT PAYMENT - EASTERN OFFICE MART INVOICE 5821", "PACKAGING SUPPLIES FROM METRO PACKERS", "ORBIT IT SERVICES"):
+   - Extract the CLEAN entity/vendor name as suggested_ledger (e.g. "Eastern Office Mart", "Metro Packers", "Orbit IT Services").
+   - Set suggested_group_name = "Sundry Creditors".
+   - Set suggested_voucher_type = "Payment".
+   - Set transaction_type = "supplier_payment".
+
+2. CUSTOMER RECEIPTS / INFLOWS (e.g. "RTGS RECEIVED - NORTHSTAR DISTRIBUTORS ADVANCE", "CUSTOMER PAYMENT RECEIVED AGAINST INVOICE SI-2048", "REFUND RECEIVED - CUSTOMER ORDER 9012"):
+   - Extract the CLEAN customer name as suggested_ledger (e.g. "Northstar Distributors", "Customer Order 9012" or "Trade Customer").
+   - Set suggested_group_name = "Sundry Debtors".
+   - Set suggested_voucher_type = "Receipt".
+   - Set transaction_type = "customer_receipt".
+
+3. OPERATIONAL EXPENSES & UTILITIES:
+   - Identify the exact expense from the narration:
+     * Electricity / Power -> suggested_ledger: "Electricity Expenses" (Group: "Indirect Expenses")
+     * Office Rent / Lease -> suggested_ledger: "Office Rent" (Group: "Indirect Expenses")
+     * Insurance Premium / Policy -> suggested_ledger: "Insurance Premium" (Group: "Indirect Expenses")
+     * Mobile / Internet / Telecom -> suggested_ledger: "Telephone & Internet Charges" (Group: "Indirect Expenses")
+     * Salary / Wages Transfer -> suggested_ledger: "Salary Expenses" (Group: "Indirect Expenses")
+     * Bank Charges / SMS / Maintenance -> suggested_ledger: "Bank Charges" (Group: "Indirect Expenses")
+     * Fuel / Delivery / Conveyance -> suggested_ledger: "Travelling & Conveyance" (Group: "Indirect Expenses")
+     * Cloud / Software Subscription -> suggested_ledger: "Software & Subscription Expenses" (Group: "Indirect Expenses")
+     * Stationery / Prints -> suggested_ledger: "Printing & Stationery" (Group: "Indirect Expenses")
+     * GST Liability / Tax -> suggested_ledger: "GST Tax Liability" (Group: "Duties & Taxes")
+     * Counter retail sale / POS -> suggested_ledger: "Counter Sales" (Group: "Sales Accounts")
+
+4. CONTRA (Cash deposits, ATM cash withdrawals, Inter-bank transfers):
+   - Narration containing "ATM CASH", "CASH WITHDRAWAL", "CASH DEPOSIT", "CDM", "SELF TRANSFER":
+   - suggested_voucher_type = "Contra"
+   - suggested_ledger = "Cash" (Group: "Cash-in-hand") or the other bank ledger name
+   - confidence = 0.95, requires_human_review = false.
+
+5. GENUINELY AMBIGUOUS / CRYPTIC: If the narration is completely obscure or unrecognizable:
    - Set suggested_ledger = "Suspense Account", suggested_group_name = "Indirect Expenses".
    - Set confidence = 0.40 to 0.60, requires_human_review = true.
-   - Provide an actionable ambiguity_reason explaining why accountant verification is required.
+   - Provide an actionable ambiguity_reason.
 
 Respond ONLY with a valid JSON object matching this schema:
 {{
   "transaction_type": "supplier_payment | customer_receipt | bank_charges | utility_expense | office_expense | travel_expense | rent_expense | contra_transfer | other",
   "suggested_voucher_type": "Payment | Receipt | Contra | Journal",
-  "suggested_ledger": "Clean ledger name",
+  "suggested_ledger": "Clean specific ledger name (NEVER a group name like 'Sundry Creditors')",
   "suggested_group_name": "One of the Available Account Groups",
   "requires_new_ledger": true or false,
   "contra_ledger": "Bank ledger or null",
@@ -481,14 +647,20 @@ Respond ONLY with a valid JSON object matching this schema:
         parts = [p.strip() for p in re.split(r'[/|\-]+', text) if p.strip()]
         candidates = []
         for p in parts:
-            clean = re.sub(r'^(neft|rtgs|imps|upi|nach|cms|pos|chq|wdl|dep|in|out|transfer|txn|ref)\b[\s:]*', '', p, flags=re.IGNORECASE).strip()
+            clean = re.sub(r'^(neft|rtgs|imps|upi|nach|cms|pos|chq|wdl|dep|in|out|transfer|txn|ref|payment|receipt)\b[\s:]*', '', p, flags=re.IGNORECASE).strip()
+            clean = re.sub(r'^(payment to|payment from|received from|received against|advance for|supplies from)\b[\s:]*', '', clean, flags=re.IGNORECASE).strip()
             if not clean or re.fullmatch(r'[A-Za-z0-9_]{10,}', clean) or re.fullmatch(r'\d+', clean):
                 continue
-            if clean.lower() in ["bank", "statement", "payment", "receipt", "account", "transfer", "dr", "cr"]:
+            if clean.lower() in ["bank", "statement", "payment", "receipt", "account", "transfer", "dr", "cr", "sundry creditors", "sundry debtors"]:
                 continue
             candidates.append(clean)
         if candidates:
+            # Pick candidate that looks most like an entity/party name
             target = candidates[-1]
+            if len(candidates) > 1 and any(k in candidates[0].lower() for k in ["payment", "receipt", "deposit", "withdrawal"]):
+                target = candidates[1]
+            # Strip trailing invoice, order, advance, dates, locations
+            target = re.sub(r'\s+(invoice|inv|bill|advance|order|annual support|support|amc|liability|collection|nov|november|dec|december)\b.*$', '', target, flags=re.IGNORECASE).strip()
             target = re.sub(r'\s+(it hardware amc|premises bangalore|mum|del|blr)$', '', target, flags=re.IGNORECASE).strip()
             if len(target) >= 3 and not target.lower().startswith("unrecognized"):
                 return target.title()

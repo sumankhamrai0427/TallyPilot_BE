@@ -288,6 +288,19 @@ class WorkflowService:
                     bool(ai_prop.suggested_ledger)
                 )
 
+                # Strict Guardrail: A ledger name must NEVER be identical to an Account Group name!
+                generic_groups = {
+                    "sundry creditors", "sundry debtors", "direct expenses", "indirect expenses",
+                    "bank accounts", "cash-in-hand", "sales accounts", "purchase accounts",
+                    "duties & taxes", "capital account"
+                } | {g.lower() for g in company_groups}
+
+                if ai_prop.suggested_ledger and ai_prop.suggested_ledger.strip().lower() in generic_groups:
+                    print(f"   🚫 [Autonomous Engine Guardrail] Blocked attempt to register AccountGroup '{ai_prop.suggested_ledger}' as a ledger account!", flush=True)
+                    is_autonomous_candidate = False
+                    ai_prop.requires_human_review = True
+                    ai_prop.ambiguity_reason = f"Generic group name '{ai_prop.suggested_ledger}' was suggested as a ledger. Human review required to assign specific entity/expense ledger."
+
                 if is_autonomous_candidate and ai_prop.suggested_ledger not in ledgers:
                     target_group_name = getattr(ai_prop, "suggested_group_name", None)
                     group = None
