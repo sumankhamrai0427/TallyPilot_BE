@@ -86,7 +86,8 @@ class LocalLLMService:
         narration: str,
         debit_amount: float,
         credit_amount: float,
-        available_ledgers: List[str]
+        available_ledgers: List[str],
+        available_groups: Optional[List[str]] = None
     ) -> Tuple[AICorrectionProposal, bool]:
         """
         Classifies transaction narration using Mistral LLM (Cloud or Local),
@@ -100,7 +101,7 @@ class LocalLLMService:
             fallback = self._rule_based_fallback(narration, debit_amount, credit_amount, available_ledgers)
             return fallback, True
 
-        prompt = self._build_prompt(narration, debit_amount, credit_amount, available_ledgers)
+        prompt = self._build_prompt(narration, debit_amount, credit_amount, available_ledgers, available_groups)
         print(f"   🤖 [LLM Calling] Provider: {self.active_llm.upper()} | Model: {self.model} ...", flush=True)
         
         try:
@@ -125,7 +126,7 @@ class LocalLLMService:
                         content = res.json()["choices"][0]["message"]["content"]
                         print(f"   ✅ [LLM Response] {content.strip()}", flush=True)
                         parsed_json = json.loads(content)
-                        return self._process_llm_json(parsed_json, available_ledgers)
+                        return self._process_llm_json(parsed_json, available_ledgers, debit_amount, credit_amount, narration, available_groups)
                     else:
                         print(f"   ⚠️ [LLM API Error] Status {res.status_code}: {res.text}", flush=True)
 
@@ -148,7 +149,7 @@ class LocalLLMService:
                                 content = res.json()["choices"][0]["message"]["content"]
                                 print(f"   ✅ [LLM Response] {content.strip()}", flush=True)
                                 parsed_json = json.loads(re.search(r'\{.*\}', content, re.DOTALL).group(0))
-                                return self._process_llm_json(parsed_json, available_ledgers)
+                                return self._process_llm_json(parsed_json, available_ledgers, debit_amount, credit_amount, narration, available_groups)
                         except Exception as e:
                             continue
 
@@ -167,7 +168,7 @@ class LocalLLMService:
                             content = body.get("response", "{}")
                             print(f"   ✅ [LLM Response] {content.strip()}", flush=True)
                             parsed_json = json.loads(content)
-                            return self._process_llm_json(parsed_json, available_ledgers)
+                            return self._process_llm_json(parsed_json, available_ledgers, debit_amount, credit_amount, narration, available_groups)
                     except Exception as e:
                         pass
 
@@ -179,38 +180,126 @@ class LocalLLMService:
         print(f"   💡 [Fallback Rule Result] Suggested Ledger: \"{fallback.suggested_ledger}\" | Voucher: {fallback.suggested_voucher_type.value} | Confidence: {float(fallback.confidence)*100:.1f}%", flush=True)
         return fallback, True
 
-    def _process_llm_json(self, parsed_json: Dict[str, Any], available_ledgers: List[str]) -> Tuple[AICorrectionProposal, bool]:
-        """Validates LLM JSON output and checks ledger availability."""
+    def _process_llm_json(
+        self,
+        parsed_json: Dict[str, Any],
+        available_ledgers: List[str],
+        debit: float = 0.0,
+        credit: float = 0.0,
+        narration: str = "",
+        available_groups: Optional[List[str]] = None
+    ) -> Tuple[AICorrectionProposal, bool]:
+        """Validates LLM JSON output against company ledgers without forcing wrong suppliers."""
         proposal = AICorrectionProposal(**parsed_json)
-        if proposal.suggested_ledger and proposal.suggested_ledger not in available_ledgers:
-            closest = self._find_closest_ledger(proposal.suggested_ledger, available_ledgers)
-            proposal.suggested_ledger = closest
-            proposal.confidence = min(proposal.confidence, 0.70)
-            proposal.requires_human_review = True
-            proposal.ambiguity_reason = f"Original suggestion '{parsed_json.get('suggested_ledger')}' not in Tally ledgers. Closest match '{closest}' requires confirmation."
-        print(f"   💡 [LLM Suggestion] Ledger: \"{proposal.suggested_ledger}\" | Voucher: {proposal.suggested_voucher_type.value} | Confidence: {float(proposal.confidence)*100:.1f}%", flush=True)
+        narr_lower = (narration or "").lower()
+
+        # Enforce strict double-entry direction consistency
+        if credit > 0:
+            if proposal.suggested_voucher_type not in (VoucherType.RECEIPT, VoucherType.CONTRA):
+                proposal.suggested_voucher_type = VoucherType.RECEIPT
+            if proposal.transaction_type == "supplier_payment":
+                proposal.transaction_type = "customer_receipt"
+        elif debit > 0:
+            if proposal.suggested_voucher_type == VoucherType.RECEIPT:
+                proposal.suggested_voucher_type = VoucherType.PAYMENT
+
+        # Dynamic account group resolution
+        if available_groups:
+            matched_grp = next((g for g in available_groups if g.lower() == (proposal.suggested_group_name or "").lower()), None)
+            if matched_grp:
+                proposal.suggested_group_name = matched_grp
+            else:
+                # Dynamic contextual matching based on transaction purpose & flow direction
+                if credit > 0:
+                    if any(k in narr_lower for k in ["interest", "int.", "dividend", "yield", "fd int"]):
+                        proposal.suggested_group_name = next((g for g in available_groups if "Income" in g), "Indirect Incomes")
+                    elif any(k in narr_lower for k in ["sales", "pos", "counter", "merchant"]):
+                        proposal.suggested_group_name = next((g for g in available_groups if "Sales" in g or "Income" in g), "Sales Accounts")
+                    elif any(k in narr_lower for k in ["refund", "gst", "tax", "it refund", "subsidy"]):
+                        proposal.suggested_group_name = next((g for g in available_groups if "Tax" in g or "Asset" in g), "Duties & Taxes")
+                    else:
+                        proposal.suggested_group_name = next((g for g in available_groups if "Debtor" in g or "Customer" in g), "Sundry Debtors")
+                else:
+                    if any(k in narr_lower for k in ["supplier", "hardware", "contractor", "services", "ltd", "corp", "pvt"]):
+                        proposal.suggested_group_name = next((g for g in available_groups if "Creditor" in g or "Supplier" in g), "Sundry Creditors")
+                    else:
+                        proposal.suggested_group_name = next((g for g in available_groups if "Expense" in g), "Indirect Expenses")
+        else:
+            if not proposal.suggested_group_name:
+                proposal.suggested_group_name = "Sundry Debtors" if credit > 0 else "Indirect Expenses"
+
+        matched = None
+        if proposal.suggested_ledger:
+            for l in available_ledgers:
+                if l.strip().lower() == proposal.suggested_ledger.strip().lower():
+                    matched = l
+                    break
+
+        if matched:
+            proposal.suggested_ledger = matched
+            proposal.requires_new_ledger = False
+        else:
+            proposal.requires_new_ledger = True
+
+            # Autonomous Intelligence:
+            # If the LLM has high confidence (>= threshold) AND did not flag review,
+            # allow autonomous registration without forcing human clarification!
+            if proposal.confidence >= self.confidence_threshold and not proposal.requires_human_review:
+                proposal.requires_human_review = False
+            else:
+                proposal.requires_human_review = True
+                proposal.ambiguity_reason = proposal.ambiguity_reason or f"Ledger '{proposal.suggested_ledger}' needs review under '{proposal.suggested_group_name}'."
+
+        print(f"   💡 [LLM Suggestion] Ledger: \"{proposal.suggested_ledger}\" | Group: \"{proposal.suggested_group_name}\" | New: {proposal.requires_new_ledger} | Confidence: {float(proposal.confidence)*100:.1f}%", flush=True)
         return proposal, False
 
-    def _build_prompt(self, narration: str, debit: float, credit: float, ledgers: List[str]) -> str:
-        direction = f"Withdrawal/Debit: {debit}" if debit > 0 else f"Deposit/Credit: {credit}"
-        ledgers_str = ", ".join(f'"{l}"' for l in ledgers[:40])
-        return f"""You are an expert Tally Prime accounting classifier.
-Analyze the following bank transaction description and classify it strictly into JSON format.
+    def _build_prompt(self, narration: str, debit: float, credit: float, ledgers: List[str], available_groups: Optional[List[str]] = None) -> str:
+        direction = f"Withdrawal/Debit (Outgoing payment): {debit}" if debit > 0 else f"Deposit/Credit (Incoming receipt): {credit}"
+        ledgers_str = ", ".join(f'"{l}"' for l in ledgers[:50])
+        groups_list = available_groups or [
+            "Sundry Debtors", "Sundry Creditors", "Indirect Expenses", "Direct Expenses",
+            "Sales Accounts", "Purchase Accounts", "Indirect Incomes", "Duties & Taxes",
+            "Bank Accounts", "Cash-in-hand", "Capital Account"
+        ]
+        groups_str = ", ".join(f'"{g}"' for g in groups_list)
+        return f"""You are an autonomous expert Tally Prime accounting classification intelligence.
+Analyze this Indian bank transaction and classify it into strict double-entry accounting with real-world business context.
 
 Transaction Direction: {direction}
-Narration: "{narration}"
-Allowed Tally Ledgers: [{ledgers_str}]
+Bank Narration: "{narration}"
+Existing Company Ledgers in Database: [{ledgers_str}]
+Available Account Groups in Master Database: [{groups_str}]
+
+Classification & Entity Grounding Rules:
+1. EXISTING LEDGERS: If the narration clearly matches an EXISTING ledger (e.g. Office Rent, Electricity, Bank Charges, or an existing Customer/Supplier), use that exact ledger with confidence >= 0.88 and requires_new_ledger = false.
+2. DYNAMIC GROUP & ENTITY RECOGNITION:
+   - For incoming money (Credit/Receipt):
+     * If from a customer, buyer, or trade invoice -> choose "Sundry Debtors".
+     * If bank interest, savings interest, or dividend -> choose "Indirect Incomes".
+     * If tax/GST refund or subsidy -> choose "Duties & Taxes" or "Current Assets".
+     * If cash sales, pos, counter retail -> choose "Sales Accounts".
+   - For outgoing money (Debit/Payment):
+     * If commercial vendor/supplier/contractor -> choose "Sundry Creditors".
+     * If operational expenses (rent, electricity, amc, pantry, telecom, freight) -> choose "Indirect Expenses" or "Direct Expenses".
+   - Select suggested_group_name strictly from the Available Account Groups list above.
+3. CONTRA: For ATM cash withdrawals, cash deposits, or inter-bank self-transfers, classify as suggested_voucher_type = "Contra", suggested_ledger = "Cash" (or other bank), confidence = 0.92, requires_human_review = false.
+4. GENUINELY AMBIGUOUS / CRYPTIC: If the narration is completely obscure, unverified, cryptic, or suspicious (e.g. "UPI/849204910294/UNRECOGNIZED-STORE", obscure personal string, or unexplained debit):
+   - Set suggested_ledger = "Suspense Account", suggested_group_name = "Indirect Expenses".
+   - Set confidence = 0.40 to 0.60, requires_human_review = true.
+   - Provide an actionable ambiguity_reason explaining why accountant verification is required.
 
 Respond ONLY with a valid JSON object matching this schema:
 {{
-  "transaction_type": "supplier_payment | customer_receipt | bank_charges | utility_expense | salary_payment | contra_transfer | other",
+  "transaction_type": "supplier_payment | customer_receipt | bank_charges | utility_expense | office_expense | travel_expense | rent_expense | contra_transfer | other",
   "suggested_voucher_type": "Payment | Receipt | Contra | Journal",
-  "suggested_ledger": "Must be one of the Allowed Tally Ledgers or null",
+  "suggested_ledger": "Clean ledger name",
+  "suggested_group_name": "One of the Available Account Groups",
+  "requires_new_ledger": true or false,
   "contra_ledger": "Bank ledger or null",
   "confidence": 0.0 to 1.0,
   "requires_human_review": true or false,
-  "ambiguity_reason": "Explanation if uncertain or null",
-  "explanation": "Brief rationale"
+  "ambiguity_reason": "Explanation if review needed or null",
+  "explanation": "Concise accounting rationale"
 }}"""
 
     def _rule_based_fallback(
@@ -226,76 +315,116 @@ Respond ONLY with a valid JSON object matching this schema:
         default_voucher = VoucherType.PAYMENT if is_debit else VoucherType.RECEIPT
         default_type = "supplier_payment" if is_debit else "customer_receipt"
 
-        # Check bank charges
+        # 1. Check Bank Charges
         if any(w in text for w in ["chg", "charge", "charges", "annual fee", "sms", "sms chg", "min bal", "gst"]):
             ledger = self._find_ledger_matching(["bank charges", "indirect expenses"], available_ledgers)
             return AICorrectionProposal(
                 transaction_type="bank_charges",
                 suggested_voucher_type=VoucherType.PAYMENT,
-                suggested_ledger=ledger,
+                suggested_ledger=ledger or "Bank Charges",
+                suggested_group_name="Indirect Expenses",
+                requires_new_ledger=(ledger is None),
                 contra_ledger=self._get_bank_ledger(available_ledgers),
                 confidence=0.92,
                 requires_human_review=False,
                 explanation="Detected bank operational fees or charges in narration."
             )
 
-        # Check electricity / utilities
+        # 2. Check Supermarket / Retail / Pantry Expenses (DMart, Blinkit, Grocery, etc.)
+        if any(w in text for w in ["dmart", "supermarket", "grocery", "groceries", "blinkit", "zepto", "reliance fresh", "spencer", "more retail", "convenience store", "bazaar", "mart"]):
+            pantry_ledger = self._find_ledger_matching(["pantry", "office / pantry", "office expenses", "general expenses", "staff welfare"], available_ledgers)
+            return AICorrectionProposal(
+                transaction_type="office_expense",
+                suggested_voucher_type=VoucherType.PAYMENT,
+                suggested_ledger=pantry_ledger or "Office / Pantry Expenses",
+                suggested_group_name="Indirect Expenses",
+                requires_new_ledger=(pantry_ledger is None),
+                contra_ledger=self._get_bank_ledger(available_ledgers),
+                confidence=0.90,
+                requires_human_review=(pantry_ledger is None),
+                ambiguity_reason="Office pantry/supermarket purchase detected. Propose creating Office / Pantry Expenses." if pantry_ledger is None else None,
+                explanation="Retail supermarket or grocery purchase categorized as office pantry expense."
+            )
+
+        # 3. Check Electricity / Utilities
         if any(w in text for w in ["electricity", "power", "bescom", "wbsedcl", "tneb", "cesc"]):
             ledger = self._find_ledger_matching(["electricity expenses", "utility"], available_ledgers)
             return AICorrectionProposal(
                 transaction_type="utility_expense",
                 suggested_voucher_type=VoucherType.PAYMENT,
-                suggested_ledger=ledger,
+                suggested_ledger=ledger or "Electricity Expenses",
+                suggested_group_name="Indirect Expenses",
+                requires_new_ledger=(ledger is None),
                 contra_ledger=self._get_bank_ledger(available_ledgers),
                 confidence=0.88,
                 requires_human_review=False,
                 explanation="Utility electricity bill payment detected."
             )
 
-        # Check telephone / internet
+        # 4. Check Telephone / Internet
         if any(w in text for w in ["airtel", "jio", "vodafone", "telecom", "broadband", "internet"]):
-            ledger = self._find_ledger_matching(["telephone & internet charges", "telephone"], available_ledgers)
+            ledger = self._find_ledger_matching(["telephone & internet charges", "telephone", "internet"], available_ledgers)
             return AICorrectionProposal(
                 transaction_type="utility_expense",
                 suggested_voucher_type=VoucherType.PAYMENT,
-                suggested_ledger=ledger,
+                suggested_ledger=ledger or "Telephone & Internet Charges",
+                suggested_group_name="Indirect Expenses",
+                requires_new_ledger=(ledger is None),
                 contra_ledger=self._get_bank_ledger(available_ledgers),
                 confidence=0.89,
                 requires_human_review=False,
                 explanation="Telecommunication charges detected."
             )
 
-        # Check rent
+        # 5. Check Fuel & Conveyance / Travel
+        if any(w in text for w in ["petrol", "diesel", "fuel", "hpcl", "bpcl", "indianoil", "iocl", "shell", "uber", "ola", "irctc", "indigo", "makemytrip"]):
+            travel_ledger = self._find_ledger_matching(["travelling & conveyance", "travelling", "conveyance", "fuel"], available_ledgers)
+            return AICorrectionProposal(
+                transaction_type="travel_expense",
+                suggested_voucher_type=VoucherType.PAYMENT,
+                suggested_ledger=travel_ledger or "Travelling & Conveyance",
+                suggested_group_name="Indirect Expenses",
+                requires_new_ledger=(travel_ledger is None),
+                contra_ledger=self._get_bank_ledger(available_ledgers),
+                confidence=0.88,
+                requires_human_review=(travel_ledger is None),
+                explanation="Fuel or travel conveyance expense detected."
+            )
+
+        # 6. Check Rent
         if any(w in text for w in ["rent", "lease", "office rent"]):
             ledger = self._find_ledger_matching(["office rent", "rent"], available_ledgers)
             return AICorrectionProposal(
                 transaction_type="rent_expense",
                 suggested_voucher_type=VoucherType.PAYMENT,
-                suggested_ledger=ledger,
+                suggested_ledger=ledger or "Office Rent",
+                suggested_group_name="Indirect Expenses",
+                requires_new_ledger=(ledger is None),
                 contra_ledger=self._get_bank_ledger(available_ledgers),
                 confidence=0.90,
                 requires_human_review=False,
                 explanation="Office rent payment detected."
             )
 
-        # Check Contra (Inter-bank or ATM cash withdrawal)
+        # 7. Check Contra (Inter-bank or ATM cash withdrawal)
         if any(w in text for w in ["atm cash", "cash wdl", "cash dep", "self transfer", "contra", "to sbi", "from sbi", "to hdfc"]):
             contra_target = self._find_other_bank(text, available_ledgers)
             return AICorrectionProposal(
                 transaction_type="contra_transfer",
                 suggested_voucher_type=VoucherType.CONTRA,
-                suggested_ledger=contra_target,
+                suggested_ledger=contra_target or "Cash",
+                suggested_group_name="Cash-in-hand" if contra_target == "Cash" else "Bank Accounts",
+                requires_new_ledger=False,
                 contra_ledger=self._get_bank_ledger(available_ledgers),
-                confidence=0.85,
-                requires_human_review=True,
-                ambiguity_reason="Internal cash/bank transfer requires account verification.",
-                explanation="Cash withdrawal or inter-bank contra transfer detected."
+                confidence=0.92,
+                requires_human_review=False,
+                explanation="Cash withdrawal or inter-bank contra transfer verified."
             )
 
-        # Check supplier or customer by keywords in available ledgers
+        # 8. Check supplier or customer by EXACT or TOKEN match in available ledgers
         matched_ledger = None
         for ledger in available_ledgers:
-            tokens = [t.lower() for t in re.split(r'[\s&,.-]+', ledger) if len(t) > 3 and t.lower() not in ["ltd", "limited", "pvt", "private", "corp", "inc", "account", "bank"]]
+            tokens = [t.lower() for t in re.split(r'[\s&,.-]+', ledger) if len(t) > 3 and t.lower() not in ["ltd", "limited", "pvt", "private", "corp", "inc", "account", "bank", "expenses"]]
             if tokens and any(t in text for t in tokens):
                 matched_ledger = ledger
                 break
@@ -305,37 +434,79 @@ Respond ONLY with a valid JSON object matching this schema:
                 transaction_type=default_type,
                 suggested_voucher_type=default_voucher,
                 suggested_ledger=matched_ledger,
+                suggested_group_name=None,
+                requires_new_ledger=False,
                 contra_ledger=self._get_bank_ledger(available_ledgers),
-                confidence=0.85,
+                confidence=0.88,
                 requires_human_review=False,
                 explanation=f"Identified matching party ledger '{matched_ledger}' in narration."
             )
 
-        # Ambiguous / Unidentified transaction requiring clarification
+        # 8b. Autonomous Commercial Entity Disambiguation (vendors / retail customers)
+        clean_party = self._extract_clean_party_name(narration)
+        is_unrecognized = any(w in text for w in ["unrecognized", "unknown", "suspicious", "fraud", "dispute", "unmapped"])
+
+        if clean_party and len(clean_party) >= 3 and not is_unrecognized:
+            is_expense_purpose = any(w in text for w in ["amc", "service", "hardware", "software", "maintenance", "consult", "supply", "logistics", "freight", "repair"])
+            suggested_grp = "Indirect Expenses" if is_expense_purpose else ("Sundry Creditors" if is_debit else "Sundry Debtors")
+            return AICorrectionProposal(
+                transaction_type="supplier_payment" if is_debit else "customer_receipt",
+                suggested_voucher_type=default_voucher,
+                suggested_ledger=clean_party,
+                suggested_group_name=suggested_grp,
+                requires_new_ledger=True,
+                contra_ledger=self._get_bank_ledger(available_ledgers),
+                confidence=0.89,
+                requires_human_review=False,
+                explanation=f"Autonomous entity recognition: Identified commercial entity '{clean_party}' under '{suggested_grp}'."
+            )
+
+        # 9. Ambiguous / Unidentified transaction - propose Suspense Account, NEVER an unrelated supplier!
+        suspense_ledger = self._find_ledger_matching(["suspense", "suspense account"], available_ledgers)
         return AICorrectionProposal(
             transaction_type=default_type,
             suggested_voucher_type=default_voucher,
-            suggested_ledger=None,
+            suggested_ledger=suspense_ledger or "Suspense Account",
+            suggested_group_name="Indirect Expenses",
+            requires_new_ledger=(suspense_ledger is None),
             contra_ledger=self._get_bank_ledger(available_ledgers),
-            confidence=0.45,
+            confidence=0.40,
             requires_human_review=True,
-            ambiguity_reason="Unable to determine exact accounting ledger from description. Human clarification required.",
-            explanation="Unrecognized party or narration pattern."
+            ambiguity_reason="Unrecognized party or narration pattern. Assigned to Suspense Account pending human clarification.",
+            explanation="Unrecognized transaction description."
         )
+
+    def _extract_clean_party_name(self, narration: str) -> Optional[str]:
+        text = narration.strip()
+        parts = [p.strip() for p in re.split(r'[/|\-]+', text) if p.strip()]
+        candidates = []
+        for p in parts:
+            clean = re.sub(r'^(neft|rtgs|imps|upi|nach|cms|pos|chq|wdl|dep|in|out|transfer|txn|ref)\b[\s:]*', '', p, flags=re.IGNORECASE).strip()
+            if not clean or re.fullmatch(r'[A-Za-z0-9_]{10,}', clean) or re.fullmatch(r'\d+', clean):
+                continue
+            if clean.lower() in ["bank", "statement", "payment", "receipt", "account", "transfer", "dr", "cr"]:
+                continue
+            candidates.append(clean)
+        if candidates:
+            target = candidates[-1]
+            target = re.sub(r'\s+(it hardware amc|premises bangalore|mum|del|blr)$', '', target, flags=re.IGNORECASE).strip()
+            if len(target) >= 3 and not target.lower().startswith("unrecognized"):
+                return target.title()
+        return None
 
     def _find_ledger_matching(self, patterns: List[str], ledgers: List[str]) -> Optional[str]:
         for pat in patterns:
             for l in ledgers:
                 if pat.lower() in l.lower():
                     return l
-        return ledgers[0] if ledgers else None
+        return None
 
     def _find_closest_ledger(self, suggestion: str, ledgers: List[str]) -> Optional[str]:
         s_lower = suggestion.lower()
         for l in ledgers:
             if s_lower in l.lower() or l.lower() in s_lower:
                 return l
-        return ledgers[0] if ledgers else None
+        return None
 
     def _get_bank_ledger(self, ledgers: List[str]) -> Optional[str]:
         for l in ledgers:

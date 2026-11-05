@@ -55,11 +55,33 @@ class CompanyRepository:
         return self.db.query(Company).filter(Company.is_active == True).order_by(Company.id.asc()).first()
 
     def get_current_fy(self, company_id: int) -> Optional[FinancialYear]:
-        return (
+        fy = (
             self.db.query(FinancialYear)
             .filter(FinancialYear.company_id == company_id, FinancialYear.is_current == 1)
             .first()
         )
+        if not fy:
+            fy = (
+                self.db.query(FinancialYear)
+                .filter(FinancialYear.company_id == company_id)
+                .order_by(FinancialYear.id.desc())
+                .first()
+            )
+        if not fy:
+            import datetime
+            now = datetime.datetime.utcnow()
+            fy_start_year = now.year if now.month >= 4 else now.year - 1
+            fy = FinancialYear(
+                company_id=company_id,
+                name=f"FY {fy_start_year}-{str(fy_start_year + 1)[-2:]}",
+                start_date=datetime.date(fy_start_year, 4, 1),
+                end_date=datetime.date(fy_start_year + 1, 3, 31),
+                is_current=1
+            )
+            self.db.add(fy)
+            self.db.commit()
+            self.db.refresh(fy)
+        return fy
 
     def list_financial_years(self, company_id: int) -> List[FinancialYear]:
         return (
@@ -82,7 +104,7 @@ class CompanyRepository:
             currency=data.get("currency", "INR"),
             tally_company_name=data.get("tally_company_name") or data["name"],
             tally_url=data.get("tally_url", "http://localhost:9000"),
-            default_bank_ledger=data.get("default_bank_ledger", "HDFC Bank"),
+            default_bank_ledger=data.get("default_bank_ledger") or None,
             tally_simulation_mode=bool(data.get("tally_simulation_mode", True)),
             is_active=bool(data.get("is_active", True))
         )
@@ -130,24 +152,25 @@ class CompanyRepository:
                 self.db.flush()
             group_map[g_name] = grp
 
-        # Default bank ledger
+        # Default bank ledger from company setup if provided
         comp = self.get_by_id(company_id)
-        bank_name = (comp.default_bank_ledger if comp and comp.default_bank_ledger else "HDFC Bank")
-        bank_ledger = self.db.query(LedgerAccount).filter(
-            LedgerAccount.company_id == company_id,
-            LedgerAccount.name == bank_name
-        ).first()
-        if not bank_ledger and "Bank Accounts" in group_map:
-            bank_ledger = LedgerAccount(
-                company_id=company_id,
-                group_id=group_map["Bank Accounts"].id,
-                name=bank_name,
-                code="BNK-001",
-                opening_balance=Decimal("0.00"),
-                current_balance=Decimal("0.00"),
-                is_active=True
-            )
-            self.db.add(bank_ledger)
+        bank_name = (comp.default_bank_ledger.strip() if comp and comp.default_bank_ledger else None)
+        if bank_name and "Bank Accounts" in group_map:
+            bank_ledger = self.db.query(LedgerAccount).filter(
+                LedgerAccount.company_id == company_id,
+                LedgerAccount.name == bank_name
+            ).first()
+            if not bank_ledger:
+                bank_ledger = LedgerAccount(
+                    company_id=company_id,
+                    group_id=group_map["Bank Accounts"].id,
+                    name=bank_name,
+                    code="BNK-001",
+                    opening_balance=Decimal("0.00"),
+                    current_balance=Decimal("0.00"),
+                    is_active=True
+                )
+                self.db.add(bank_ledger)
 
         # Cash ledger
         cash_ledger = self.db.query(LedgerAccount).filter(
@@ -274,6 +297,21 @@ class LedgerRepository:
     def list_by_company(self, company_id: int, is_active: Optional[bool] = True) -> List[LedgerAccount]:
         query = self.db.query(LedgerAccount).options(joinedload(LedgerAccount.group)).filter(
             LedgerAccount.company_id == company_id
+        )
+        if is_active is not None:
+            query = query.filter(LedgerAccount.is_active == is_active)
+        return query.order_by(LedgerAccount.name.asc()).all()
+
+    def list_bank_ledgers(self, company_id: int, is_active: Optional[bool] = True) -> List[LedgerAccount]:
+        """Lists all active bank account ledgers under Bank Accounts / OD groups for the company."""
+        query = (
+            self.db.query(LedgerAccount)
+            .join(AccountGroup, AccountGroup.id == LedgerAccount.group_id)
+            .options(joinedload(LedgerAccount.group))
+            .filter(
+                LedgerAccount.company_id == company_id,
+                AccountGroup.name.in_(("Bank Accounts", "Bank OD A/c", "Bank OCC A/c"))
+            )
         )
         if is_active is not None:
             query = query.filter(LedgerAccount.is_active == is_active)
@@ -581,6 +619,17 @@ class BatchRepository:
     def __init__(self, db: Session):
         self.db = db
 
+    def create(self, batch: ImportBatch) -> ImportBatch:
+        self.db.add(batch)
+        self.db.commit()
+        self.db.refresh(batch)
+        return batch
+
+    def update(self, batch: ImportBatch) -> ImportBatch:
+        self.db.commit()
+        self.db.refresh(batch)
+        return batch
+
     def get_by_id(self, batch_id: int) -> Optional[ImportBatch]:
         return self.db.query(ImportBatch).filter(ImportBatch.id == batch_id).first()
 
@@ -599,16 +648,78 @@ class BatchRepository:
             query = query.filter(ImportBatch.company_id == company_id)
         return query.order_by(ImportBatch.created_at.desc()).limit(limit).all()
 
-    def create(self, batch: ImportBatch) -> ImportBatch:
-        self.db.add(batch)
-        self.db.commit()
-        self.db.refresh(batch)
-        return batch
 
-    def update(self, batch: ImportBatch) -> ImportBatch:
+class DocumentRepository:
+    def __init__(self, db: Session):
+        self.db = db
+
+    def create(
+        self,
+        document: Optional[Document] = None,
+        company_id: Optional[int] = None,
+        filename: Optional[str] = None,
+        file_path: Optional[str] = None,
+        file_hash: Optional[str] = None,
+        file_size_bytes: int = 0,
+        document_type: str = "BANK_STATEMENT",
+        mime_type: Optional[str] = None,
+        uploaded_by: str = "SYSTEM",
+        status: str = "PENDING",
+        **kwargs
+    ) -> Document:
+        """Create a new document record.
+        
+        Supports passing either a Document entity instance (standard repository pattern):
+            repo.create(doc)
+        Or passing keyword arguments directly:
+            repo.create(company_id=1, filename="...", ...)
+        """
+        if isinstance(document, Document):
+            doc = document
+        else:
+            cid = company_id or kwargs.get("company_id")
+            fn = filename or kwargs.get("filename")
+            fp = file_path or kwargs.get("file_path")
+            fh = file_hash or kwargs.get("file_hash")
+            fs = file_size_bytes if file_size_bytes != 0 else kwargs.get("file_size_bytes", 0)
+            dt = document_type or kwargs.get("document_type", "BANK_STATEMENT")
+            mt = mime_type or kwargs.get("mime_type")
+            ub = uploaded_by or kwargs.get("uploaded_by", "SYSTEM")
+            st = status or kwargs.get("status", "PENDING")
+            
+            doc = Document(
+                company_id=cid,
+                document_type=dt,
+                filename=fn,
+                file_path=fp,
+                file_hash=fh,
+                file_size_bytes=fs,
+                mime_type=mt,
+                uploaded_by=ub,
+                status=st
+            )
+        self.db.add(doc)
         self.db.commit()
-        self.db.refresh(batch)
-        return batch
+        self.db.refresh(doc)
+        return doc
+
+    def get_by_hash(self, file_hash: str, company_id: Optional[int] = None) -> Optional[Document]:
+        query = self.db.query(Document).filter(Document.file_hash == file_hash)
+        if company_id is not None:
+            query = query.filter(Document.company_id == company_id)
+        return query.first()
+
+    def list_by_company(self, company_id: int, limit: int = 50, document_type: Optional[str] = None) -> List[Document]:
+        query = self.db.query(Document).filter(Document.company_id == company_id)
+        if document_type:
+            query = query.filter(Document.document_type == document_type)
+        return query.order_by(Document.created_at.desc()).limit(limit).all()
+
+    def get_by_id(self, doc_id: int, company_id: Optional[int] = None) -> Optional[Document]:
+        query = self.db.query(Document).filter(Document.id == doc_id)
+        if company_id is not None:
+            query = query.filter(Document.company_id == company_id)
+        return query.first()
 
 
 class AuditRepository:

@@ -301,33 +301,36 @@ class ExcelReaderService:
         name = re.sub(r'[^a-z0-9 /._-]', '', name)
         return name
 
+    def _alias_matches(self, alias: str, col: str) -> bool:
+        if alias == col:
+            return True
+        # For short abbreviations (e.g. 'cr', 'dr', 'ref'), match whole word boundaries only
+        # to prevent 'cr' from falsely matching 'description / narration' or 'dr' matching 'withdraw'.
+        if len(alias) <= 3:
+            return bool(re.search(rf"\b{re.escape(alias)}\b", col))
+        return alias in col
+
     def _match_columns(self, cols: List[str]) -> Dict[str, Optional[str]]:
         mapping = {"date": None, "narration": None, "debit": None, "credit": None, "ref": None, "balance": None}
         for col in cols:
             for alias in DATE_ALIASES:
-                if alias == col or alias in col:
-                    if not mapping["date"]:
-                        mapping["date"] = col
+                if self._alias_matches(alias, col) and not mapping["date"]:
+                    mapping["date"] = col
             for alias in NARRATION_ALIASES:
-                if alias == col or alias in col:
-                    if not mapping["narration"]:
-                        mapping["narration"] = col
+                if self._alias_matches(alias, col) and not mapping["narration"]:
+                    mapping["narration"] = col
             for alias in DEBIT_ALIASES:
-                if alias == col or alias in col:
-                    if not mapping["debit"]:
-                        mapping["debit"] = col
+                if self._alias_matches(alias, col) and not mapping["debit"]:
+                    mapping["debit"] = col
             for alias in CREDIT_ALIASES:
-                if alias == col or alias in col:
-                    if not mapping["credit"]:
-                        mapping["credit"] = col
+                if self._alias_matches(alias, col) and not mapping["credit"]:
+                    mapping["credit"] = col
             for alias in REF_ALIASES:
-                if alias == col or alias in col:
-                    if not mapping["ref"]:
-                        mapping["ref"] = col
+                if self._alias_matches(alias, col) and not mapping["ref"]:
+                    mapping["ref"] = col
             for alias in BALANCE_ALIASES:
-                if alias == col or alias in col:
-                    if not mapping["balance"]:
-                        mapping["balance"] = col
+                if self._alias_matches(alias, col) and not mapping["balance"]:
+                    mapping["balance"] = col
         return mapping
 
     def _parse_date(self, val: Any) -> Optional[date]:

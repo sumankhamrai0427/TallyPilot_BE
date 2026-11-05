@@ -1,5 +1,6 @@
 import enum
 from datetime import datetime
+from typing import Optional, Dict, Any, List
 from sqlalchemy import (
     Column, Integer, String, Text, Numeric, Boolean,
     DateTime, ForeignKey, JSON, Date, Enum, UniqueConstraint, CheckConstraint
@@ -137,7 +138,7 @@ class Company(Base):
     currency = Column(String(8), default="INR", nullable=False)
     tally_company_name = Column(String(255), nullable=True)
     tally_url = Column(String(255), default="http://localhost:9000", nullable=True)
-    default_bank_ledger = Column(String(255), default="HDFC Bank", nullable=True)
+    default_bank_ledger = Column(String(255), default=None, nullable=True)
     tally_simulation_mode = Column(Boolean, default=True, nullable=False)
     is_active = Column(Boolean, default=True, nullable=False, index=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
@@ -317,7 +318,7 @@ class BankTransaction(Base):
 
     @property
     def bank_ledger_name(self):
-        return self.bank_ledger.name if self.bank_ledger else "HDFC Bank"
+        return self.bank_ledger.name if self.bank_ledger else None
 
     @property
     def amount(self):
@@ -359,6 +360,18 @@ class TransactionClassification(Base):
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
     transaction = relationship("BankTransaction", back_populates="classification")
+
+    @property
+    def requires_new_ledger(self) -> bool:
+        if self.raw_ai_response and isinstance(self.raw_ai_response, dict):
+            return bool(self.raw_ai_response.get("requires_new_ledger", False))
+        return False
+
+    @property
+    def suggested_group_name(self) -> Optional[str]:
+        if self.raw_ai_response and isinstance(self.raw_ai_response, dict):
+            return self.raw_ai_response.get("suggested_group_name")
+        return None
 
 
 class HumanReview(Base):

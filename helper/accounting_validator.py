@@ -14,7 +14,9 @@ class AccountingValidatorService:
         target_ledger: Optional[str],
         voucher_type: Optional[str],
         contra_ledger: Optional[str],
-        available_ledgers: List[str]
+        available_ledgers: List[str],
+        allow_new_ledger: bool = False,
+        suggested_group: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         Validates accounting consistency and compliance before allowing voucher posting.
@@ -49,8 +51,11 @@ class AccountingValidatorService:
             errors.append("Target ledger is not assigned.")
             requires_clarification = True
         elif target_ledger not in available_ledgers:
-            errors.append(f"Target ledger '{target_ledger}' does not exist in Tally master ledgers.")
-            requires_clarification = True
+            if allow_new_ledger:
+                warnings.append(f"Target ledger '{target_ledger}' will be autonomously registered under '{suggested_group or 'Indirect Expenses'}'.")
+            else:
+                errors.append(f"Target ledger '{target_ledger}' does not exist in Tally master ledgers.")
+                requires_clarification = True
 
         # 4. Bank / Contra Ledger Verification
         effective_contra = contra_ledger or self.default_bank_ledger

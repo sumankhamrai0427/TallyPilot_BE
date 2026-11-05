@@ -8,7 +8,7 @@ from flask import request, jsonify
 from database.dbConnection import SessionLocal
 from utils.config import config
 from helper.workflow_service import WorkflowService
-from database.repositories import BatchRepository
+from database.repositories import BatchRepository, DocumentRepository
 from model.schemas import ImportBatchOut
 from helper.tenant import resolve_tenant_context
 
@@ -24,13 +24,14 @@ def upload_bank_statement():
         return jsonify({"detail": "No files uploaded. Provide file(s) in form field 'files' or 'file'"}), 400
 
     valid_extensions = [".xlsx", ".xls", ".csv", ".pdf", ".txt"]
-    os.makedirs(config.INPUT_DIR, exist_ok=True)
-
     successful_batches = []
     failed_files = []
 
     db = SessionLocal()
     try:
+        company_id, fy_id = resolve_tenant_context(db)
+        bank_ledger_id = request.form.get("bank_ledger_id", type=int) or request.args.get("bank_ledger_id", type=int)
+        company_input_dir = config.get_company_input_dir(company_id)
         workflow = WorkflowService(db)
         for uploaded_file in uploaded_files:
             if not uploaded_file.filename:
@@ -45,7 +46,7 @@ def upload_bank_statement():
                 })
                 continue
 
-            destination_path = os.path.join(config.INPUT_DIR, filename)
+            destination_path = os.path.join(company_input_dir, filename)
             try:
                 try:
                     uploaded_file.save(destination_path)
@@ -54,11 +55,17 @@ def upload_bank_statement():
                     import time
                     name_part, ext_part = os.path.splitext(filename)
                     alt_filename = f"{name_part}_{int(time.time())}{ext_part}"
-                    destination_path = os.path.join(config.INPUT_DIR, alt_filename)
+                    destination_path = os.path.join(company_input_dir, alt_filename)
                     uploaded_file.save(destination_path)
                     filename = alt_filename
 
-                batch = workflow.ingest_excel_file(destination_path, filename)
+                batch = workflow.ingest_excel_file(
+                    destination_path,
+                    filename,
+                    company_id=company_id,
+                    fy_id=fy_id,
+                    bank_ledger_id=bank_ledger_id
+                )
                 batch_dict = ImportBatchOut.model_validate(batch).model_dump(mode="json")
                 successful_batches.append(batch_dict)
             except ValueError as ve:
@@ -140,22 +147,23 @@ def upload_bank_statement():
 
 
 def scan_input_folder():
-    """Scans the configured input directory for new statement files (.xlsx, .xls, .csv, .pdf, .txt)."""
-    os.makedirs(config.INPUT_DIR, exist_ok=True)
+    """Scans the active tenant company's input directory for new statement files (.xlsx, .xls, .csv, .pdf, .txt)."""
     valid_exts = (".xlsx", ".xls", ".csv", ".pdf", ".txt")
     db = SessionLocal()
     try:
+        company_id, _ = resolve_tenant_context(db)
+        company_input_dir = config.get_company_input_dir(company_id)
         workflow = WorkflowService(db)
         processed_batches = []
 
         files = [
-            f for f in os.listdir(config.INPUT_DIR)
+            f for f in os.listdir(company_input_dir)
             if f.lower().endswith(valid_exts) and not f.startswith("~$")
         ]
         for filename in files:
-            full_path = os.path.join(config.INPUT_DIR, filename)
+            full_path = os.path.join(company_input_dir, filename)
             try:
-                batch = workflow.ingest_excel_file(full_path, filename)
+                batch = workflow.ingest_excel_file(full_path, filename, company_id=company_id)
                 processed_batches.append(ImportBatchOut.model_validate(batch).model_dump(mode="json"))
             except Exception:
                 try:
@@ -165,6 +173,36 @@ def scan_input_folder():
                 continue
 
         return jsonify(processed_batches)
+    finally:
+        db.close()
+
+
+def list_documents():
+    """Lists uploaded documents for the active tenant company from the documents table."""
+    limit = request.args.get("limit", default=50, type=int)
+    doc_type = request.args.get("document_type")
+    db = SessionLocal()
+    try:
+        company_id, _ = resolve_tenant_context(db)
+        repo = DocumentRepository(db)
+        docs = repo.list_by_company(company_id=company_id, limit=limit, document_type=doc_type)
+        return jsonify([
+            {
+                "id": d.id,
+                "company_id": d.company_id,
+                "document_type": d.document_type,
+                "filename": d.filename,
+                "file_path": d.file_path,
+                "file_hash": d.file_hash,
+                "file_size_bytes": d.file_size_bytes,
+                "mime_type": d.mime_type,
+                "uploaded_by": d.uploaded_by,
+                "status": d.status,
+                "created_at": d.created_at.isoformat() if d.created_at else None,
+                "updated_at": d.updated_at.isoformat() if d.updated_at else None,
+            }
+            for d in docs
+        ])
     finally:
         db.close()
 

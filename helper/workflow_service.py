@@ -7,10 +7,10 @@ from sqlalchemy import func
 from model.models import (
     BankTransaction, ImportBatch, TransactionClassification,
     HumanReview, ApprovalRecord, TallySubmission, TransactionStatus, VoucherType,
-    LedgerAccount, AccountGroup
+    LedgerAccount, AccountGroup, Document, AuditLog
 )
 from database.repositories import (
-    TransactionRepository, BatchRepository, LedgerRepository, AuditRepository, CompanyRepository
+    TransactionRepository, BatchRepository, LedgerRepository, AuditRepository, CompanyRepository, DocumentRepository
 )
 from helper.tenant import resolve_tenant_context
 from helper.excel_reader import ExcelReaderService
@@ -27,6 +27,7 @@ class WorkflowService:
         self.db = db
         self.tx_repo = TransactionRepository(db)
         self.batch_repo = BatchRepository(db)
+        self.doc_repo = DocumentRepository(db)
         self.ledger_repo = LedgerRepository(db)
         self.comp_repo = CompanyRepository(db)
         self.audit_repo = AuditRepository(db)
@@ -35,63 +36,120 @@ class WorkflowService:
         self.validator = AccountingValidatorService()
         self.tally_client = TallyClientService()
 
-    def ingest_excel_file(self, file_path: str, filename: str) -> ImportBatch:
+    def ingest_excel_file(
+        self,
+        file_path: str,
+        filename: str,
+        company_id: Optional[int] = None,
+        fy_id: Optional[int] = None,
+        bank_ledger_id: Optional[int] = None
+    ) -> ImportBatch:
         # Resolve multi-tenant context
-        company_id, fy_id = resolve_tenant_context(self.db)
+        if company_id is None:
+            resolved_cid, resolved_fy = resolve_tenant_context(self.db)
+            company_id = resolved_cid
+            if fy_id is None:
+                fy_id = resolved_fy
+
+        if fy_id is None:
+            current_fy = self.comp_repo.get_current_fy(company_id)
+            fy_id = current_fy.id if current_fy else 1
 
         # 1. Read file and check hash for duplicates within the active company
         file_hash, file_size, _ = self.excel_reader.read_and_validate_file(file_path)
 
         existing_batch = self.batch_repo.get_by_file_hash(file_hash, company_id=company_id)
         if existing_batch:
-            print("\n" + "=" * 78, flush=True)
-            print(f"⚠️ [Duplicate Statement File Detected]", flush=True)
-            print(f"📁 File Name      : {filename}", flush=True)
-            print(f"📦 Existing Batch : {existing_batch.batch_id} (Imported: {existing_batch.created_at})", flush=True)
-            print(f"🛑 Reason         : Re-upload blocked to prevent duplicate General Ledger postings.", flush=True)
-            print("=" * 78 + "\n", flush=True)
-            self.audit_repo.log(
-                action="DUPLICATE_FILE_REJECTED",
-                summary=f"File {filename} rejected as duplicate of batch {existing_batch.batch_id}",
-                company_id=company_id,
-                details={"file_hash": file_hash, "original_batch_id": existing_batch.batch_id}
-            )
-            raise ValueError(f"Duplicate file detected. This file was previously imported in batch '{existing_batch.batch_id}'.")
+            # If the batch failed or was aborted/stuck in processing, clean it up to allow fresh retry
+            if existing_batch.status in ("FAILED", "PROCESSING"):
+                print(f"🧹 [Auto-Cleanup] Found incomplete/aborted batch {existing_batch.batch_id} (status: {existing_batch.status}). Cleaning up to allow fresh ingestion...", flush=True)
+                try:
+                    self.db.query(AuditLog).filter(AuditLog.batch_id == existing_batch.id).update({AuditLog.batch_id: None})
+                    self.db.query(BankTransaction).filter(BankTransaction.batch_id == existing_batch.id).delete()
+                    self.db.delete(existing_batch)
+                    self.db.commit()
+                except Exception as del_err:
+                    print(f"⚠️ Warning cleaning up aborted batch: {del_err}", flush=True)
+                    self.db.rollback()
+            else:
+                print("\n" + "=" * 78, flush=True)
+                print(f"⚠️ [Duplicate Statement File Detected]", flush=True)
+                print(f"📁 File Name      : {filename}", flush=True)
+                print(f"📦 Existing Batch : {existing_batch.batch_id} (Imported: {existing_batch.created_at})", flush=True)
+                print(f"🛑 Reason         : Re-upload blocked to prevent duplicate General Ledger postings.", flush=True)
+                print("=" * 78 + "\n", flush=True)
+                self.audit_repo.log(
+                    action="DUPLICATE_FILE_REJECTED",
+                    summary=f"File {filename} rejected as duplicate of batch {existing_batch.batch_id}",
+                    company_id=company_id,
+                    details={"file_hash": file_hash, "original_batch_id": existing_batch.batch_id}
+                )
+                raise ValueError(f"Duplicate file detected. This file was previously imported in batch '{existing_batch.batch_id}'.")
 
-        # Resolve company bank ledger
-        bank_ledger = (
-            self.db.query(LedgerAccount)
-            .join(AccountGroup, AccountGroup.id == LedgerAccount.group_id)
-            .filter(
-                LedgerAccount.company_id == company_id,
-                AccountGroup.name.in_(("Bank Accounts", "Bank OD A/c"))
-            )
-            .first()
-        )
+        # Resolve company bank ledger dynamically (Zero Hardcoding)
+        bank_ledger = None
+        if bank_ledger_id:
+            bank_ledger = self.db.query(LedgerAccount).filter(
+                LedgerAccount.id == bank_ledger_id,
+                LedgerAccount.company_id == company_id
+            ).first()
+
         if not bank_ledger:
-            # Auto-seed standard chart of accounts & bank ledger for this company
+            comp = self.comp_repo.get_by_id(company_id)
+            if comp and comp.default_bank_ledger:
+                bank_ledger = self.db.query(LedgerAccount).filter(
+                    LedgerAccount.company_id == company_id,
+                    LedgerAccount.name == comp.default_bank_ledger.strip()
+                ).first()
+
+        if not bank_ledger:
+            bank_ledger = (
+                self.db.query(LedgerAccount)
+                .join(AccountGroup, AccountGroup.id == LedgerAccount.group_id)
+                .filter(
+                    LedgerAccount.company_id == company_id,
+                    AccountGroup.name.in_(("Bank Accounts", "Bank OD A/c", "Bank OCC A/c"))
+                )
+                .order_by(LedgerAccount.id.asc())
+                .first()
+            )
+
+        if not bank_ledger:
+            # Auto-seed standard chart of accounts
             self.comp_repo.seed_company_chart_of_accounts(company_id)
             bank_ledger = (
                 self.db.query(LedgerAccount)
                 .join(AccountGroup, AccountGroup.id == LedgerAccount.group_id)
                 .filter(
                     LedgerAccount.company_id == company_id,
-                    AccountGroup.name.in_(("Bank Accounts", "Bank OD A/c"))
+                    AccountGroup.name.in_(("Bank Accounts", "Bank OD A/c", "Bank OCC A/c"))
                 )
+                .order_by(LedgerAccount.id.asc())
                 .first()
             )
-        if not bank_ledger:
-            bank_ledger = self.db.query(LedgerAccount).filter(
-                LedgerAccount.company_id == company_id,
-                LedgerAccount.name.ilike("%HDFC%")
-            ).first()
-        if not bank_ledger:
-            bank_ledger = self.db.query(LedgerAccount).filter(
-                LedgerAccount.company_id == company_id
-            ).first()
 
         if not bank_ledger:
-            raise ValueError(f"Unable to initialize Bank Ledger for company ID {company_id}.")
+            # Create a clean fallback Bank Ledger named 'Bank Account' under Bank Accounts
+            bank_group = self.db.query(AccountGroup).filter(
+                AccountGroup.company_id == company_id,
+                AccountGroup.name == "Bank Accounts"
+            ).first()
+            if bank_group:
+                bank_ledger = LedgerAccount(
+                    company_id=company_id,
+                    group_id=bank_group.id,
+                    name="Bank Account",
+                    code="BNK-001",
+                    opening_balance=Decimal("0.00"),
+                    current_balance=Decimal("0.00"),
+                    is_active=True
+                )
+                self.db.add(bank_ledger)
+                self.db.commit()
+                self.db.refresh(bank_ledger)
+
+        if not bank_ledger:
+            raise ValueError(f"Unable to initialize Bank Ledger for company ID {company_id}. Please create a Bank Ledger under 'Bank Accounts'.")
 
         bank_ledger_id = bank_ledger.id
 
@@ -108,6 +166,28 @@ class WorkflowService:
             status="PROCESSING"
         )
         self.batch_repo.create(batch)
+
+        # Register document in documents table
+        doc_entry = None
+        try:
+            doc_record = Document(
+                company_id=company_id,
+                filename=filename,
+                file_path=file_path,
+                file_hash=file_hash,
+                file_size_bytes=file_size,
+                document_type="BANK_STATEMENT",
+                mime_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" if filename.lower().endswith((".xlsx", ".xls")) else "text/csv",
+                uploaded_by="SYSTEM",
+                status="PENDING"
+            )
+            doc_entry = self.doc_repo.create(doc_record)
+        except Exception as doc_err:
+            print(f"[Document] Warning registering document record: {doc_err}", flush=True)
+            try:
+                self.db.rollback()
+            except Exception:
+                pass
 
         self.audit_repo.log(
             action="BATCH_UPLOADED",
@@ -136,13 +216,13 @@ class WorkflowService:
             print(f"📑 Statement Rows : {total_valid} valid row(s) to process", flush=True)
             print("=" * 78, flush=True)
 
-            # Available ledgers from master
-            ledgers = [l.name for l in self.ledger_repo.list_all()]
-            if not ledgers:
-                sync_list, _ = self.tally_client.sync_ledgers_from_tally()
-                for item in sync_list:
-                    self.ledger_repo.upsert(item["name"], item["parent_group"])
-                ledgers = [l.name for l in self.ledger_repo.list_all()]
+            # Available ledgers for active company
+            company_ledgers_db = self.ledger_repo.list_by_company(company_id=company_id, is_active=True)
+            if not company_ledgers_db:
+                self.comp_repo.seed_company_chart_of_accounts(company_id)
+                company_ledgers_db = self.ledger_repo.list_by_company(company_id=company_id, is_active=True)
+
+            ledgers = [l.name for l in company_ledgers_db]
 
             for idx, row_data in enumerate(valid_rows, 1):
                 debit_f = float(row_data["debit_amount"])
@@ -170,12 +250,14 @@ class WorkflowService:
                 )
                 self.tx_repo.create(tx)
 
-                # 4. Local AI Classification
+                # 4. Local AI Classification with company's active Chart of Accounts groups
+                company_groups = [g.name for g in self.db.query(AccountGroup).filter(AccountGroup.company_id == company_id).all()]
                 ai_prop, is_fallback = self.llm_service.classify_transaction(
                     narration=row_data["narration"],
                     debit_amount=debit_f,
                     credit_amount=credit_f,
-                    available_ledgers=ledgers
+                    available_ledgers=ledgers,
+                    available_groups=company_groups
                 )
 
                 classification = TransactionClassification(
@@ -189,10 +271,70 @@ class WorkflowService:
                     confidence=Decimal(str(round(ai_prop.confidence, 4))),
                     explanation=ai_prop.explanation,
                     ambiguity_reason=ai_prop.ambiguity_reason,
-                    requires_human_review=ai_prop.requires_human_review,
-                    is_fallback_rule=is_fallback
+                    requires_human_review=ai_prop.requires_human_review or (ai_prop.confidence < self.llm_service.confidence_threshold),
+                    is_fallback_rule=is_fallback,
+                    raw_ai_response={
+                        "requires_new_ledger": getattr(ai_prop, "requires_new_ledger", False),
+                        "suggested_group_name": getattr(ai_prop, "suggested_group_name", None),
+                        "explanation": ai_prop.explanation,
+                    }
                 )
                 self.tx_repo.add_classification(classification)
+
+                # Check if this high-confidence transaction needs a new ledger created autonomously
+                is_autonomous_candidate = (
+                    ai_prop.confidence >= self.llm_service.confidence_threshold and
+                    not ai_prop.requires_human_review and
+                    bool(ai_prop.suggested_ledger)
+                )
+
+                if is_autonomous_candidate and ai_prop.suggested_ledger not in ledgers:
+                    target_group_name = getattr(ai_prop, "suggested_group_name", None)
+                    group = None
+                    if target_group_name:
+                        group = self.db.query(AccountGroup).filter(
+                            AccountGroup.company_id == company_id,
+                            AccountGroup.name == target_group_name
+                        ).first()
+                        if not group:
+                            group = self.db.query(AccountGroup).filter(
+                                AccountGroup.company_id == company_id,
+                                AccountGroup.name.ilike(f"%{target_group_name}%")
+                            ).first()
+
+                    if not group:
+                        # Category-aware fallback from company's actual groups
+                        if ai_prop.suggested_voucher_type == VoucherType.RECEIPT:
+                            group = self.db.query(AccountGroup).filter(
+                                AccountGroup.company_id == company_id,
+                                AccountGroup.name.in_(["Sundry Debtors", "Sales Accounts", "Indirect Incomes"])
+                            ).first()
+                        else:
+                            group = self.db.query(AccountGroup).filter(
+                                AccountGroup.company_id == company_id,
+                                AccountGroup.name.in_(["Indirect Expenses", "Sundry Creditors"])
+                            ).first()
+
+                    if not group:
+                        group = self.db.query(AccountGroup).filter(
+                            AccountGroup.company_id == company_id
+                        ).first()
+
+                    if group:
+                        auto_ledger = LedgerAccount(
+                            company_id=company_id,
+                            group_id=group.id,
+                            name=ai_prop.suggested_ledger.strip(),
+                            code=f"LED-{uuid.uuid4().hex[:6].upper()}",
+                            opening_balance=Decimal("0.00"),
+                            current_balance=Decimal("0.00"),
+                            is_active=True
+                        )
+                        self.db.add(auto_ledger)
+                        self.db.commit()
+                        self.db.refresh(auto_ledger)
+                        ledgers.append(auto_ledger.name)
+                        print(f"   🌱 [Autonomous Ledger Engine] Registered '{auto_ledger.name}' under '{group.name}' (Confidence: {float(ai_prop.confidence)*100:.0f}%)", flush=True)
 
                 # 5. Deterministic Accounting Validation
                 val_res = self.validator.validate_transaction(
@@ -200,7 +342,9 @@ class WorkflowService:
                     target_ledger=ai_prop.suggested_ledger,
                     voucher_type=ai_prop.suggested_voucher_type.value,
                     contra_ledger=ai_prop.contra_ledger,
-                    available_ledgers=ledgers
+                    available_ledgers=ledgers,
+                    allow_new_ledger=is_autonomous_candidate,
+                    suggested_group=getattr(ai_prop, "suggested_group_name", None)
                 )
 
                 # State machine transition
@@ -246,9 +390,21 @@ class WorkflowService:
                 company_id=company_id,
                 batch_id=batch.id
             )
+            if doc_entry:
+                try:
+                    doc_entry.status = "PROCESSED"
+                    self.db.commit()
+                except Exception:
+                    pass
             return batch
 
         except Exception as e:
+            if doc_entry:
+                try:
+                    doc_entry.status = "FAILED"
+                    self.db.commit()
+                except Exception:
+                    pass
             batch.status = "FAILED"
             batch.error_message = str(e)
             self.batch_repo.update(batch)
@@ -268,26 +424,92 @@ class WorkflowService:
         if tx.status not in [TransactionStatus.NEEDS_CLARIFICATION.value, TransactionStatus.PARSED.value]:
             raise ValueError(f"Transaction status '{tx.status}' is not eligible for clarification.")
 
+        target_name = req.selected_ledger.strip()
+
+        # Check if the chosen ledger exists in the company's ledger_accounts table; if not, auto-create it!
+        existing_leg = self.db.query(LedgerAccount).filter(
+            LedgerAccount.company_id == tx.company_id,
+            LedgerAccount.name == target_name
+        ).first()
+
+        if not existing_leg:
+            grp_name = req.suggested_group_name
+            target_grp = None
+            if grp_name:
+                target_grp = self.db.query(AccountGroup).filter(
+                    AccountGroup.company_id == tx.company_id,
+                    AccountGroup.name == grp_name
+                ).first()
+                if not target_grp:
+                    target_grp = self.db.query(AccountGroup).filter(
+                        AccountGroup.company_id == tx.company_id,
+                        AccountGroup.name.ilike(f"%{grp_name}%")
+                    ).first()
+
+            if not target_grp:
+                if req.corrected_voucher_type == VoucherType.RECEIPT:
+                    target_grp = self.db.query(AccountGroup).filter(
+                        AccountGroup.company_id == tx.company_id,
+                        AccountGroup.name.in_(["Sundry Debtors", "Sales Accounts", "Indirect Incomes"])
+                    ).first()
+                else:
+                    target_grp = self.db.query(AccountGroup).filter(
+                        AccountGroup.company_id == tx.company_id,
+                        AccountGroup.name.in_(["Indirect Expenses", "Sundry Creditors"])
+                    ).first()
+
+            if not target_grp:
+                self.comp_repo.seed_company_chart_of_accounts(tx.company_id)
+                target_grp = self.db.query(AccountGroup).filter(
+                    AccountGroup.company_id == tx.company_id
+                ).first()
+
+            if target_grp:
+                import random
+                code_prefix = "EXP" if "Expense" in target_grp.name else "LED"
+                new_leg = LedgerAccount(
+                    company_id=tx.company_id,
+                    group_id=target_grp.id,
+                    name=target_name,
+                    code=f"{code_prefix}-{random.randint(100, 999)}",
+                    opening_balance=Decimal("0.00"),
+                    current_balance=Decimal("0.00"),
+                    is_active=True
+                )
+                self.db.add(new_leg)
+                self.db.commit()
+                self.db.refresh(new_leg)
+
+        # Determine Bank Ledger Name for contra entry
+        bank_name = tx.bank_ledger.name if tx.bank_ledger else None
+        if not bank_name:
+            comp = self.comp_repo.get_by_id(tx.company_id)
+            bank_name = (comp.default_bank_ledger.strip() if comp and comp.default_bank_ledger else None)
+        if not bank_name:
+            bank_ledgers = self.ledger_repo.list_bank_ledgers(tx.company_id)
+            bank_name = bank_ledgers[0].name if bank_ledgers else "Bank Account"
+
         review = HumanReview(
             company_id=tx.company_id,
             transaction_id=tx.id,
             reviewer_user="finance_user",
             corrected_transaction_type=req.corrected_transaction_type,
             corrected_voucher_type=req.corrected_voucher_type.value,
-            selected_ledger=req.selected_ledger,
-            contra_ledger="HDFC Bank",
+            selected_ledger=target_name,
+            contra_ledger=bank_name,
             reviewer_notes=req.reviewer_notes,
             resolution_action=req.resolution_action
         )
         self.tx_repo.add_review(review)
 
-        # Re-run deterministic validation
-        ledgers = [l.name for l in self.ledger_repo.list_all()]
+        # Re-run deterministic validation with active company's ledgers
+        company_ledgers = self.ledger_repo.list_by_company(tx.company_id, is_active=True)
+        ledgers = [l.name for l in company_ledgers]
         val_res = self.validator.validate_transaction(
             tx=tx,
-            target_ledger=req.selected_ledger,
+            target_ledger=target_name,
             voucher_type=req.corrected_voucher_type.value,
-            contra_ledger="HDFC Bank",
+            contra_ledger=bank_name,
             available_ledgers=ledgers
         )
 
@@ -311,10 +533,13 @@ class WorkflowService:
                     tx = refreshed_tx
             except Exception as auto_post_err:
                 print(f">> [WorkflowService] Auto-post after clarification error for Tx #{tx.id}: {auto_post_err}")
+                raise ValueError(f"Transaction clarified, but posting failed: {auto_post_err}")
         else:
             tx.status = TransactionStatus.NEEDS_CLARIFICATION.value
             tx.requires_review = True
             self.tx_repo.update(tx)
+            err_msg = "; ".join(val_res["errors"])
+            raise ValueError(f"Accounting validation failed: {err_msg}")
 
         self.audit_repo.log(
             action="TRANSACTION_CLARIFIED",
@@ -340,17 +565,27 @@ class WorkflowService:
 
         target_ledger = None
         voucher_type = None
-        contra_ledger = "HDFC Bank"
+
+        # Determine Bank Ledger Name for contra entry (Zero Hardcoding)
+        bank_name = tx.bank_ledger.name if tx.bank_ledger else None
+        if not bank_name:
+            comp = self.comp_repo.get_by_id(tx.company_id)
+            bank_name = (comp.default_bank_ledger.strip() if comp and comp.default_bank_ledger else None)
+        if not bank_name:
+            bank_ledgers = self.ledger_repo.list_bank_ledgers(tx.company_id)
+            bank_name = bank_ledgers[0].name if bank_ledgers else "Bank Account"
+
+        contra_ledger = bank_name
 
         if tx.reviews:
             latest_review = tx.reviews[-1]
             target_ledger = latest_review.selected_ledger
             voucher_type = latest_review.corrected_voucher_type
-            contra_ledger = latest_review.contra_ledger or "HDFC Bank"
+            contra_ledger = latest_review.contra_ledger or bank_name
         elif tx.classification:
             target_ledger = tx.classification.suggested_ledger
             voucher_type = tx.classification.suggested_voucher_type
-            contra_ledger = tx.classification.contra_ledger or "HDFC Bank"
+            contra_ledger = tx.classification.contra_ledger or bank_name
 
         if not target_ledger or not voucher_type:
             raise ValueError("Incomplete ledger or voucher type information. Clarification required first.")

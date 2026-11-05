@@ -276,10 +276,12 @@ def generate_voucher_from_transaction(tx_id: int):
         )
 
         if not bank_ledger:
-            bank_ledger = db.query(LedgerAccount).filter(
-                LedgerAccount.company_id == company_id,
-                LedgerAccount.name.ilike("%HDFC%")
-            ).first()
+            comp = db.query(Company).filter(Company.id == company_id).first()
+            if comp and comp.default_bank_ledger:
+                bank_ledger = db.query(LedgerAccount).filter(
+                    LedgerAccount.company_id == company_id,
+                    LedgerAccount.name == comp.default_bank_ledger.strip()
+                ).first()
 
         if not bank_ledger:
             return jsonify({"detail": "No bank ledger found for this company"}), 400

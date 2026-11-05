@@ -98,6 +98,8 @@ class AICorrectionProposal(BaseModel):
     requires_human_review: bool = Field(True, description="True if uncertain or requires verification")
     ambiguity_reason: Optional[str] = Field(None, description="Explanation why clarification is required")
     explanation: Optional[str] = Field(None, description="Concise rationale for suggestion")
+    requires_new_ledger: bool = Field(False, description="True if transaction represents a new vendor/expense head not in current COA")
+    suggested_group_name: Optional[str] = Field(None, description="Recommended standard accounting parent group, e.g. Indirect Expenses, Sundry Creditors")
 
 
 class BankTransactionBase(BaseModel):
@@ -128,6 +130,8 @@ class TransactionClassificationOut(BaseModel):
     ambiguity_reason: Optional[str]
     requires_human_review: bool
     is_fallback_rule: bool
+    requires_new_ledger: Optional[bool] = False
+    suggested_group_name: Optional[str] = None
     created_at: datetime
 
     model_config = ConfigDict(from_attributes=True)
@@ -262,6 +266,16 @@ class ClarifyTransactionRequest(BaseModel):
     corrected_transaction_type: str = Field(..., min_length=1, description="Category classification")
     reviewer_notes: Optional[str] = Field(None, description="Optional notes from accountant")
     resolution_action: str = Field(default="SUBMIT_CORRECTION")
+    create_if_missing: Optional[bool] = Field(default=False, description="Auto-create ledger if it does not exist")
+    suggested_group_name: Optional[str] = Field(None, description="Parent group if creating ledger")
+
+
+class LedgerCreateRequest(BaseModel):
+    name: str = Field(..., min_length=1)
+    group_name: Optional[str] = None
+    group_id: Optional[int] = None
+    code: Optional[str] = None
+    opening_balance: Optional[float] = 0.0
 
 
 class SkipTransactionRequest(BaseModel):

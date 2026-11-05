@@ -2,8 +2,17 @@
 Follows the EduJunction configuration pattern.
 """
 import os
+import sys
 from pathlib import Path
 from dotenv import load_dotenv
+
+# Ensure stdout and stderr handle UTF-8 cleanly on Windows without UnicodeEncodeError
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
 
 # Base paths
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -51,10 +60,35 @@ class Config:
     MISTRAL_LOCAL_MODEL: str = os.getenv("MISTRAL_LOCAL_MODEL", os.getenv("OLLAMA_MODEL", "mistral:latest"))
     AI_CONFIDENCE_THRESHOLD: float = float(os.getenv("AI_CONFIDENCE_THRESHOLD", "0.80"))
 
-    # Folder Ingestion Paths
-    INPUT_DIR: str = os.getenv("INPUT_DIR", str(PROJECT_ROOT / "input"))
-    PROCESSED_DIR: str = os.getenv("PROCESSED_DIR", str(PROJECT_ROOT / "input" / "processed"))
-    ERROR_DIR: str = os.getenv("ERROR_DIR", str(PROJECT_ROOT / "input" / "error"))
+    # Storage & Folder Ingestion Paths (Company-wise Multi-Tenant inside backend/storage)
+    STORAGE_DIR: str = os.getenv("STORAGE_DIR", str(BASE_DIR / "storage"))
+    INPUT_DIR: str = os.getenv("INPUT_DIR", str(BASE_DIR / "storage" / "input"))
+    PROCESSED_DIR: str = os.getenv("PROCESSED_DIR", str(BASE_DIR / "storage" / "processed"))
+    ERROR_DIR: str = os.getenv("ERROR_DIR", str(BASE_DIR / "storage" / "error"))
+
+    def get_company_storage_dir(self, company_id: int) -> str:
+        """Returns the base storage directory for a specific tenant company."""
+        path = os.path.join(self.STORAGE_DIR, "companies", str(company_id))
+        os.makedirs(path, exist_ok=True)
+        return path
+
+    def get_company_input_dir(self, company_id: int) -> str:
+        """Returns the input ingestion directory for a specific tenant company."""
+        path = os.path.join(self.get_company_storage_dir(company_id), "input")
+        os.makedirs(path, exist_ok=True)
+        return path
+
+    def get_company_processed_dir(self, company_id: int) -> str:
+        """Returns the processed archive directory for a specific tenant company."""
+        path = os.path.join(self.get_company_storage_dir(company_id), "processed")
+        os.makedirs(path, exist_ok=True)
+        return path
+
+    def get_company_error_dir(self, company_id: int) -> str:
+        """Returns the error archive directory for a specific tenant company."""
+        path = os.path.join(self.get_company_storage_dir(company_id), "error")
+        os.makedirs(path, exist_ok=True)
+        return path
 
     # Security & CORS
     CORS_ORIGINS: list = [

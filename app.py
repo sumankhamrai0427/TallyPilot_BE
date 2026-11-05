@@ -4,6 +4,18 @@ app.py explicitly defines all API route endpoints using Flask @app.route
 and delegates execution directly to their respective controller functions
 (matching EduJunction architecture).
 """
+import sys
+if hasattr(sys.stdout, 'reconfigure'):
+    try:
+        sys.stdout.reconfigure(encoding='utf-8')
+    except Exception:
+        pass
+if hasattr(sys.stderr, 'reconfigure'):
+    try:
+        sys.stderr.reconfigure(encoding='utf-8')
+    except Exception:
+        pass
+
 import time
 from flask import Flask, jsonify, request, g
 from flask_cors import CORS
@@ -121,6 +133,11 @@ def create_app() -> Flask:
     def api_files_get_batch(batch_id: int):
         """Retrieves an import batch by database ID."""
         return files_controller.get_batch(batch_id)
+
+    @app.route("/api/documents", methods=["GET"])
+    def api_documents_list():
+        """Lists uploaded documents from the documents table for the active tenant company."""
+        return files_controller.list_documents()
 
     # ============================================================
     # 4. Transaction Workflow Endpoints
@@ -302,10 +319,30 @@ def create_app() -> Flask:
         """Retrieves flat list of active ledger accounts."""
         return ledgers_controller.list_ledgers()
 
+    @app.route("/api/ledgers/banks", methods=["GET"])
+    def api_bank_ledgers_list():
+        """Retrieves active bank account ledgers for the active company."""
+        return ledgers_controller.list_bank_ledgers()
+
+    @app.route("/api/ledgers", methods=["POST"])
+    def api_ledgers_create():
+        """Creates a new ledger account for the active company."""
+        return ledgers_controller.create_ledger()
+
     @app.route("/api/parties", methods=["GET"])
     def api_parties_list():
         """Retrieves active parties for the company."""
         return ledgers_controller.list_parties()
+
+    @app.route("/api/groups", methods=["GET"])
+    def api_groups_list():
+        """Retrieves all account groups for the active company."""
+        return ledgers_controller.list_groups()
+
+    @app.route("/groups", methods=["GET"])
+    def api_groups_list_legacy():
+        """Retrieves all account groups for the active company (fallback path)."""
+        return ledgers_controller.list_groups()
 
     # ============================================================
     # 9. Double-Entry Vouchers & General Ledger Endpoints

@@ -6,7 +6,7 @@ from decimal import Decimal
 from database.dbConnection import SessionLocal
 from database.repositories import LedgerRepository, CompanyRepository
 from helper.tenant import resolve_tenant_context
-from model.models import LedgerAccount, AccountGroup, Party
+from model.models import LedgerAccount, AccountGroup, Party, TallyLedger
 from utils.logger import logger
 
 
@@ -27,7 +27,7 @@ def list_companies():
                 "financial_year_start_month": c.financial_year_start_month,
                 "tally_company_name": c.tally_company_name or c.name,
                 "tally_url": c.tally_url or "http://localhost:9000",
-                "default_bank_ledger": c.default_bank_ledger or "HDFC Bank",
+                "default_bank_ledger": c.default_bank_ledger or None,
                 "tally_simulation_mode": bool(c.tally_simulation_mode),
                 "is_active": bool(c.is_active)
             }
@@ -58,7 +58,7 @@ def get_company(company_id: int):
             "financial_year_start_month": c.financial_year_start_month,
             "tally_company_name": c.tally_company_name or c.name,
             "tally_url": c.tally_url or "http://localhost:9000",
-            "default_bank_ledger": c.default_bank_ledger or "HDFC Bank",
+            "default_bank_ledger": c.default_bank_ledger or None,
             "tally_simulation_mode": bool(c.tally_simulation_mode),
             "is_active": bool(c.is_active)
         }), 200
@@ -340,6 +340,34 @@ def list_ledgers():
         db.close()
 
 
+def list_bank_ledgers():
+    """Returns active bank ledgers under Bank Accounts / Bank OD groups for the active tenant company."""
+    db = SessionLocal()
+    try:
+        company_id, _ = resolve_tenant_context(db)
+        repo = LedgerRepository(db)
+        banks = repo.list_bank_ledgers(company_id=company_id)
+        return jsonify([
+            {
+                "id": b.id,
+                "company_id": b.company_id,
+                "group_id": b.group_id,
+                "group_name": b.group.name if b.group else "Bank Accounts",
+                "name": b.name,
+                "code": b.code,
+                "opening_balance": float(b.opening_balance or 0.0),
+                "current_balance": float(b.current_balance or 0.0),
+                "is_active": b.is_active
+            }
+            for b in banks
+        ]), 200
+    except Exception as e:
+        logger.error(f"Error listing bank ledgers: {e}")
+        return jsonify({"detail": str(e)}), 500
+    finally:
+        db.close()
+
+
 def list_parties():
     """Returns all active parties for the active company."""
     db = SessionLocal()
@@ -364,6 +392,177 @@ def list_parties():
         ]), 200
     except Exception as e:
         logger.error(f"Error listing parties: {e}")
+        return jsonify({"detail": str(e)}), 500
+    finally:
+        db.close()
+
+
+def create_ledger():
+    """Creates a new ledger account under an account group for the active company."""
+    data = request.get_json(silent=True) or {}
+    name = (data.get("name") or "").strip()
+    if not name:
+        return jsonify({"detail": "Ledger name is required"}), 400
+
+    group_name = (data.get("group_name") or "Indirect Expenses").strip()
+    group_id = data.get("group_id")
+    opening_balance = float(data.get("opening_balance") or 0.0)
+    code = data.get("code")
+
+    db = SessionLocal()
+    try:
+        company_id, _ = resolve_tenant_context(db)
+
+        # Check if ledger already exists
+        existing = db.query(LedgerAccount).filter(
+            LedgerAccount.company_id == company_id,
+            LedgerAccount.name == name
+        ).first()
+        if existing:
+            return jsonify({
+                "id": existing.id,
+                "company_id": existing.company_id,
+                "group_id": existing.group_id,
+                "group_name": existing.group.name if existing.group else group_name,
+                "name": existing.name,
+                "code": existing.code,
+                "opening_balance": float(existing.opening_balance),
+                "current_balance": float(existing.current_balance),
+                "is_active": existing.is_active,
+                "already_existed": True
+            }), 200
+
+        # Find target AccountGroup
+        target_group = None
+        if group_id:
+            target_group = db.query(AccountGroup).filter(
+                AccountGroup.company_id == company_id,
+                AccountGroup.id == group_id
+            ).first()
+
+        if not target_group:
+            target_group = db.query(AccountGroup).filter(
+                AccountGroup.company_id == company_id,
+                AccountGroup.name == group_name
+            ).first()
+
+        if not target_group:
+            target_group = db.query(AccountGroup).filter(
+                AccountGroup.company_id == company_id,
+                AccountGroup.name.ilike(f"%{group_name}%")
+            ).first()
+
+        if not target_group:
+            target_group = db.query(AccountGroup).filter(
+                AccountGroup.company_id == company_id,
+                AccountGroup.name == "Indirect Expenses"
+            ).first()
+
+        if not target_group:
+            comp_repo = CompanyRepository(db)
+            comp_repo.seed_company_chart_of_accounts(company_id)
+            target_group = db.query(AccountGroup).filter(
+                AccountGroup.company_id == company_id,
+                AccountGroup.name == "Indirect Expenses"
+            ).first()
+
+        if not target_group:
+            return jsonify({"detail": f"Could not resolve parent account group for company #{company_id}"}), 400
+
+        if not code:
+            prefix = "LED"
+            if "Bank" in target_group.name:
+                prefix = "BNK"
+            elif "Expense" in target_group.name:
+                prefix = "EXP"
+            elif "Creditor" in target_group.name:
+                prefix = "VND"
+            elif "Debtor" in target_group.name:
+                prefix = "CUS"
+            import random
+            code = f"{prefix}-{random.randint(100, 999)}"
+
+        new_ledger = LedgerAccount(
+            company_id=company_id,
+            group_id=target_group.id,
+            name=name,
+            code=code,
+            opening_balance=Decimal(str(opening_balance)),
+            current_balance=Decimal(str(opening_balance)),
+            is_active=True
+        )
+        db.add(new_ledger)
+        db.commit()
+        db.refresh(new_ledger)
+
+        # Also sync to TallyLedger table for backward compatibility
+        try:
+            tally_leg = db.query(TallyLedger).filter(
+                TallyLedger.company_id == company_id,
+                TallyLedger.name == name
+            ).first()
+            if not tally_leg:
+                tally_leg = TallyLedger(
+                    company_id=company_id,
+                    name=name,
+                    parent_group=target_group.name,
+                    is_active=True
+                )
+                db.add(tally_leg)
+                db.commit()
+        except Exception:
+            pass
+
+        return jsonify({
+            "id": new_ledger.id,
+            "company_id": new_ledger.company_id,
+            "group_id": new_ledger.group_id,
+            "group_name": target_group.name,
+            "name": new_ledger.name,
+            "code": new_ledger.code,
+            "opening_balance": float(new_ledger.opening_balance),
+            "current_balance": float(new_ledger.current_balance),
+            "is_active": new_ledger.is_active,
+            "already_existed": False
+        }), 201
+
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Error creating ledger: {e}")
+        return jsonify({"detail": f"Failed to create ledger: {str(e)}"}), 500
+    finally:
+        db.close()
+
+
+def list_groups():
+    """Returns all account groups for the active company."""
+    db = SessionLocal()
+    try:
+        company_id, _ = resolve_tenant_context(db)
+        groups = db.query(AccountGroup).filter(AccountGroup.company_id == company_id).order_by(AccountGroup.name.asc()).all()
+        if not groups:
+            # Seed default standard groups if not yet seeded
+            comp_repo = CompanyRepository(db)
+            comp_repo.seed_company_chart_of_accounts(company_id)
+            groups = db.query(AccountGroup).filter(AccountGroup.company_id == company_id).order_by(AccountGroup.name.asc()).all()
+
+        return jsonify([
+            {
+                "id": g.id,
+                "company_id": g.company_id,
+                "parent_id": g.parent_id,
+                "name": g.name,
+                "code": g.code,
+                "category": g.group_type,
+                "group_type": g.group_type,
+                "nature": g.nature,
+                "affects_gross_profit": bool(g.affects_gross_profit),
+                "is_builtin": bool(g.is_builtin)
+            }
+            for g in groups
+        ]), 200
+    except Exception as e:
+        logger.error(f"Error listing groups: {e}")
         return jsonify({"detail": str(e)}), 500
     finally:
         db.close()
