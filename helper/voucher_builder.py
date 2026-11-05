@@ -27,6 +27,10 @@ class VoucherBuilderService:
         clean_company = company_name.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
         clean_ref = (reference_number or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
+        # Same-ledger debit/credit anomaly guardrail
+        if clean_primary.strip().lower() == clean_contra.strip().lower() and v_type != "Contra":
+            raise ValueError(f"Accounting Anomaly: Primary ledger and contra ledger cannot be identical ('{primary_ledger}').")
+
         if v_type == "Payment":
             primary_is_deemed_positive = "Yes"
             primary_amt = f"-{amount:.2f}"

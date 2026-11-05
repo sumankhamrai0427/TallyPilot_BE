@@ -349,7 +349,7 @@ class WorkflowService:
                         ledgers.append(auto_ledger.name)
                         print(f"   🌱 [Autonomous Ledger Engine] Registered '{auto_ledger.name}' under '{group.name}' (Confidence: {float(ai_prop.confidence)*100:.0f}%)", flush=True)
 
-                # 5. Deterministic Accounting Validation
+                # 5. Deterministic Accounting Validation (6-Stage Pipeline)
                 val_res = self.validator.validate_transaction(
                     tx=tx,
                     target_ledger=ai_prop.suggested_ledger,
@@ -357,17 +357,21 @@ class WorkflowService:
                     contra_ledger=ai_prop.contra_ledger,
                     available_ledgers=ledgers,
                     allow_new_ledger=is_autonomous_candidate,
-                    suggested_group=getattr(ai_prop, "suggested_group_name", None)
+                    suggested_group=getattr(ai_prop, "suggested_group_name", None),
+                    confidence=float(ai_prop.confidence),
+                    is_refund=("refund" in (tx.narration or "").lower() or "reversal" in (tx.narration or "").lower()),
+                    is_advance=any(k in (tx.narration or "").lower() for k in ["advance", "order ref"])
                 )
 
-                # State machine transition
-                if not val_res["is_valid"] or ai_prop.requires_human_review or ai_prop.confidence < self.llm_service.confidence_threshold:
+                # State machine transition: A balanced voucher must NOT auto-post if human gate triggered!
+                if not val_res["can_auto_post"] or val_res["requires_clarification"]:
                     clarification_count += 1
                     tx.status = TransactionStatus.NEEDS_CLARIFICATION.value
                     tx.requires_review = True
                     self.tx_repo.update(tx)
-                    reason = "Confidence < 80%" if ai_prop.confidence < self.llm_service.confidence_threshold else "Accounting validation / human review flag"
-                    print(f"   ⚠️ [Pipeline Decision] -> NEEDS CLARIFICATION ({reason})", flush=True)
+                    reasons = val_res.get("warnings", []) + val_res.get("errors", [])
+                    reason_msg = "; ".join(reasons) if reasons else "Human approval gate triggered"
+                    print(f"   ⚠️ [6-Stage Pipeline Decision] -> NEEDS CLARIFICATION ({reason_msg})", flush=True)
                     print(f"      Transaction #{tx.id} queued for user review in Clarification Queue.", flush=True)
                 else:
                     auto_posted_count += 1

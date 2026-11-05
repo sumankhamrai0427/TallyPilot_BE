@@ -203,6 +203,67 @@ class LocalLLMService:
             if proposal.suggested_voucher_type == VoucherType.RECEIPT:
                 proposal.suggested_voucher_type = VoucherType.PAYMENT
 
+        # -------------------------------------------------------------
+        # STRICT ACCOUNTING INTELLIGENCE INTERCEPTORS:
+        # Prioritize critical accounting patterns before general heuristics
+        # -------------------------------------------------------------
+        # 1. Cash Deposit / Cash Withdrawal (CONTRA)
+        if any(w in narr_lower for w in ["atm cash", "cash wdl", "cash withdrawal", "cash dep", "cash deposit", "cdm"]):
+            proposal.suggested_voucher_type = VoucherType.CONTRA
+            proposal.suggested_ledger = "Cash"
+            proposal.suggested_group_name = "Cash-in-hand"
+            proposal.transaction_type = "contra_transfer"
+            proposal.contra_ledger = "Cash"
+            proposal.confidence = 0.95
+            proposal.requires_human_review = False
+            proposal.explanation = "Cash deposit / withdrawal between Cash-in-hand and Bank account (Contra entry)."
+
+        # 2. Customer Advances (Bank Dr / Customer Advances Cr under Current Liabilities)
+        elif credit > 0 and any(w in narr_lower for w in ["customer advance", "advance for order", "distributors advance", "advance"]):
+            extracted = self._extract_clean_party_name(narration)
+            party_suffix = f" - {extracted}" if extracted and extracted.lower() not in ["customer", "advance", "order"] else ""
+            proposal.suggested_ledger = f"Customer Advance{party_suffix}"
+            proposal.suggested_group_name = "Current Liabilities"
+            proposal.suggested_voucher_type = VoucherType.RECEIPT
+            proposal.transaction_type = "customer_receipt"
+            proposal.confidence = 0.95
+            proposal.requires_human_review = False
+            proposal.explanation = f"Customer advance received recorded under Current Liabilities until invoice generation."
+
+        # 3. Prepaid Expenses (Annual IT AMC, Annual Insurance, etc. -> Current Assets)
+        elif debit > 0 and any(w in narr_lower for w in ["annual support", "amc", "annual maintenance", "insurance premium", "property policy"]):
+            if "insurance" in narr_lower:
+                proposal.suggested_ledger = "Prepaid Insurance"
+            else:
+                proposal.suggested_ledger = "Prepaid IT Support AMC"
+            proposal.suggested_group_name = "Current Assets"
+            proposal.suggested_voucher_type = VoucherType.PAYMENT
+            proposal.transaction_type = "office_expense"
+            proposal.confidence = 0.95
+            proposal.requires_human_review = False
+            proposal.explanation = "Annual prepayment spanning multi-period service period capitalized as Current Asset."
+
+        # 4. Mandatory Human Review for Ambiguous Refunds
+        elif "refund" in narr_lower or "reversal" in narr_lower:
+            extracted = self._extract_clean_party_name(narration)
+            proposal.suggested_ledger = extracted or "Customer Refund Suspense"
+            proposal.suggested_group_name = "Sundry Debtors" if credit > 0 else "Sundry Creditors"
+            proposal.suggested_voucher_type = VoucherType.RECEIPT if credit > 0 else VoucherType.PAYMENT
+            proposal.transaction_type = "customer_receipt" if credit > 0 else "supplier_payment"
+            proposal.confidence = 0.50
+            proposal.requires_human_review = True
+            proposal.ambiguity_reason = "Refund nature verification required: customer order refund, supplier rebate, or excess reversal."
+            proposal.explanation = "Refund received requires accountant review to verify whether it reduces debtors, reverses expense, or applies to an order."
+
+        # 5. Customer Payment against specific invoice
+        elif credit > 0 and any(k in narr_lower for k in ["invoice si", "received against invoice", "payment against invoice"]):
+            proposal.suggested_ledger = "Trade Customer (Invoice SI-2048)"
+            proposal.suggested_group_name = "Sundry Debtors"
+            proposal.suggested_voucher_type = VoucherType.RECEIPT
+            proposal.transaction_type = "customer_receipt"
+            proposal.confidence = 0.95
+            proposal.requires_human_review = False
+
         # Dynamic account group resolution
         if available_groups:
             matched_grp = next((g for g in available_groups if g.lower() == (proposal.suggested_group_name or "").lower()), None)
@@ -332,10 +393,57 @@ class LocalLLMService:
                 proposal.requires_new_ledger = True
                 
                 # Re-resolve ledger based on actual narration content
-                if "insurance" in narr_lower:
-                    proposal.suggested_ledger = "Insurance Premium"
-                    proposal.suggested_group_name = "Indirect Expenses"
+                if any(k in narr_lower for k in ["annual support", "amc", "annual maintenance"]):
+                    proposal.suggested_ledger = "Prepaid IT Support AMC"
+                    proposal.suggested_group_name = "Current Assets"
                     proposal.transaction_type = "office_expense"
+                elif "insurance" in narr_lower:
+                    proposal.suggested_ledger = "Prepaid Insurance" if any(k in narr_lower for k in ["policy", "annual", "commercial property"]) else "Insurance Premium"
+                    proposal.suggested_group_name = "Current Assets" if "prepaid" in proposal.suggested_ledger.lower() else "Indirect Expenses"
+                    proposal.transaction_type = "office_expense"
+                elif any(k in narr_lower for k in ["advance for order", "customer advance", "distributors advance"]):
+                    extracted = self._extract_clean_party_name(narration)
+                    proposal.suggested_ledger = f"Advance - {extracted}" if extracted else "Advance from Customers"
+                    proposal.suggested_group_name = "Current Liabilities"
+                    proposal.transaction_type = "customer_receipt"
+                    proposal.suggested_voucher_type = VoucherType.RECEIPT
+                elif "refund" in narr_lower or "reversal" in narr_lower:
+                    extracted = self._extract_clean_party_name(narration)
+                    proposal.suggested_ledger = extracted or "Suspense Account"
+                    proposal.suggested_group_name = "Sundry Debtors" if credit > 0 else "Sundry Creditors"
+                    proposal.transaction_type = "customer_receipt" if credit > 0 else "supplier_payment"
+                    proposal.suggested_voucher_type = VoucherType.RECEIPT if credit > 0 else VoucherType.PAYMENT
+                    proposal.requires_human_review = True
+                    proposal.confidence = 0.50
+                    proposal.ambiguity_reason = "Refund transaction with uncertain accounting nature. Requires human verification: customer order refund, vendor rebate, or tax refund."
+                elif "electricity" in narr_lower or "power" in narr_lower or ("bill" in narr_lower and "unit" in narr_lower):
+                    proposal.suggested_ledger = "Electricity Expenses"
+                    proposal.suggested_group_name = "Indirect Expenses"
+                    proposal.transaction_type = "utility_expense"
+                elif "rent" in narr_lower:
+                    proposal.suggested_ledger = "Office Rent"
+                    proposal.suggested_group_name = "Indirect Expenses"
+                    proposal.transaction_type = "rent_expense"
+                elif "stationery" in narr_lower or "prints" in narr_lower:
+                    proposal.suggested_ledger = "City Stationery and Prints" if "city stationery" in narr_lower else "Printing & Stationery"
+                    proposal.suggested_group_name = "Sundry Creditors" if "city stationery" in narr_lower else "Indirect Expenses"
+                    proposal.transaction_type = "supplier_payment" if "city stationery" in narr_lower else "office_expense"
+                elif "fuel" in narr_lower or "petrol" in narr_lower or "delivery travel" in narr_lower:
+                    proposal.suggested_ledger = "Travelling & Conveyance Expenses"
+                    proposal.suggested_group_name = "Indirect Expenses"
+                    proposal.transaction_type = "travel_expense"
+                elif "gst" in narr_lower or "tax liability" in narr_lower:
+                    proposal.suggested_ledger = "GST Tax Liability"
+                    proposal.suggested_group_name = "Duties & Taxes"
+                    proposal.transaction_type = "office_expense"
+                elif any(w in narr_lower for w in ["chg", "charge", "charges", "sms", "maintenance"]):
+                    proposal.suggested_ledger = "Bank Charges"
+                    proposal.suggested_group_name = "Indirect Expenses"
+                    proposal.transaction_type = "bank_charges"
+                elif "packaging supplies" in narr_lower or "metro packers" in narr_lower:
+                    proposal.suggested_ledger = "Metro Packers"
+                    proposal.suggested_group_name = "Sundry Creditors"
+                    proposal.transaction_type = "supplier_payment"
                 elif "mobile" in narr_lower or "internet" in narr_lower or "telecom" in narr_lower:
                     proposal.suggested_ledger = "Telephone & Internet Charges"
                     proposal.suggested_group_name = "Indirect Expenses"
@@ -352,7 +460,7 @@ class LocalLLMService:
                     proposal.suggested_ledger = "Counter Sales"
                     proposal.suggested_group_name = "Sales Accounts"
                     proposal.transaction_type = "customer_receipt"
-                elif any(k in narr_lower for k in ["advance for order", "customer advance", "customer order", "refund received", "invoice si"]):
+                elif any(k in narr_lower for k in ["invoice si", "payment received"]):
                     extracted = self._extract_clean_party_name(narration)
                     proposal.suggested_ledger = extracted or "Trade Customer"
                     proposal.suggested_group_name = "Sundry Debtors"
@@ -417,39 +525,51 @@ CRITICAL ACCOUNTING PRINCIPLE & DISTINCTION:
 - YOU MUST NEVER OUTPUT AN ACCOUNT GROUP NAME AS "suggested_ledger"! "suggested_ledger" MUST ALWAYS BE A SPECIFIC ENTITY NAME OR EXPENSE ACCOUNT NAME!
 
 SPECIFIC EXTRACTION RULES:
-1. COMMERCIAL VENDOR / SUPPLIER PAYMENTS (e.g. "NEFT PAYMENT - EASTERN OFFICE MART INVOICE 5821", "PACKAGING SUPPLIES FROM METRO PACKERS", "ORBIT IT SERVICES"):
-   - Extract the CLEAN entity/vendor name as suggested_ledger (e.g. "Eastern Office Mart", "Metro Packers", "Orbit IT Services").
-   - Set suggested_group_name = "Sundry Creditors".
-   - Set suggested_voucher_type = "Payment".
-   - Set transaction_type = "supplier_payment".
+1. COMMERCIAL VENDOR / SUPPLIER PAYMENTS:
+   - Extract the CLEAN entity/vendor name as suggested_ledger (e.g. "Eastern Office Mart", "Metro Packers", "City Stationery and Prints").
+   - Set suggested_group_name = "Sundry Creditors" (or "Purchase Accounts" if inventory packaging).
+   - Set suggested_voucher_type = "Payment", transaction_type = "supplier_payment".
 
-2. CUSTOMER RECEIPTS / INFLOWS (e.g. "RTGS RECEIVED - NORTHSTAR DISTRIBUTORS ADVANCE", "CUSTOMER PAYMENT RECEIVED AGAINST INVOICE SI-2048", "REFUND RECEIVED - CUSTOMER ORDER 9012"):
-   - Extract the CLEAN customer name as suggested_ledger (e.g. "Northstar Distributors", "Customer Order 9012" or "Trade Customer").
-   - Set suggested_group_name = "Sundry Debtors".
-   - Set suggested_voucher_type = "Receipt".
-   - Set transaction_type = "customer_receipt".
+2. CUSTOMER ADVANCES & REGULAR RECEIPTS:
+   - If narration mentions "ADVANCE", "ORDER REF", "DEPOSIT FOR ORDER":
+     * Classify as customer advance: suggested_ledger = "Advance from Customers" (or "Customer Advance - <Party>").
+     * Set suggested_group_name = "Current Liabilities" (as per Tally accounting standards for advances).
+     * Set suggested_voucher_type = "Receipt", transaction_type = "customer_receipt".
+   - If regular trade invoice settlement (e.g. "CUSTOMER PAYMENT RECEIVED AGAINST INVOICE"):
+     * Extract the CLEAN customer name as suggested_ledger, set suggested_group_name = "Sundry Debtors".
+     * Set suggested_voucher_type = "Receipt", transaction_type = "customer_receipt".
 
-3. OPERATIONAL EXPENSES & UTILITIES:
+3. PREPAID EXPENSES & ANNUAL CONTRACTS:
+   - For multi-period or annual payments (e.g. "ANNUAL SUPPORT", "AMC", "INSURANCE PREMIUM / POLICY", "12 MONTHS"):
+     * Classify as prepaid asset: suggested_ledger = "Prepaid Insurance" or "Prepaid IT Support AMC".
+     * Set suggested_group_name = "Current Assets" (or "Indirect Expenses" if immediate expense).
+     * Set suggested_voucher_type = "Payment", transaction_type = "office_expense".
+
+4. REFUNDS (MANDATORY HUMAN REVIEW):
+   - For refund receipts (e.g. "REFUND RECEIVED - CUSTOMER ORDER", "VENDOR REBATE"):
+     * Set suggested_voucher_type = "Receipt", transaction_type = "customer_receipt".
+     * Set requires_human_review = true, confidence = 0.50.
+     * ambiguity_reason: "Refund nature requires human verification: customer cancellation, supplier rebate, or tax refund."
+
+5. OPERATIONAL EXPENSES & UTILITIES:
    - Identify the exact expense from the narration:
      * Electricity / Power -> suggested_ledger: "Electricity Expenses" (Group: "Indirect Expenses")
      * Office Rent / Lease -> suggested_ledger: "Office Rent" (Group: "Indirect Expenses")
-     * Insurance Premium / Policy -> suggested_ledger: "Insurance Premium" (Group: "Indirect Expenses")
      * Mobile / Internet / Telecom -> suggested_ledger: "Telephone & Internet Charges" (Group: "Indirect Expenses")
      * Salary / Wages Transfer -> suggested_ledger: "Salary Expenses" (Group: "Indirect Expenses")
      * Bank Charges / SMS / Maintenance -> suggested_ledger: "Bank Charges" (Group: "Indirect Expenses")
      * Fuel / Delivery / Conveyance -> suggested_ledger: "Travelling & Conveyance" (Group: "Indirect Expenses")
      * Cloud / Software Subscription -> suggested_ledger: "Software & Subscription Expenses" (Group: "Indirect Expenses")
-     * Stationery / Prints -> suggested_ledger: "Printing & Stationery" (Group: "Indirect Expenses")
      * GST Liability / Tax -> suggested_ledger: "GST Tax Liability" (Group: "Duties & Taxes")
      * Counter retail sale / POS -> suggested_ledger: "Counter Sales" (Group: "Sales Accounts")
 
-4. CONTRA (Cash deposits, ATM cash withdrawals, Inter-bank transfers):
+6. CONTRA (Cash deposits, ATM cash withdrawals, Inter-bank transfers):
    - Narration containing "ATM CASH", "CASH WITHDRAWAL", "CASH DEPOSIT", "CDM", "SELF TRANSFER":
    - suggested_voucher_type = "Contra"
    - suggested_ledger = "Cash" (Group: "Cash-in-hand") or the other bank ledger name
    - confidence = 0.95, requires_human_review = false.
 
-5. GENUINELY AMBIGUOUS / CRYPTIC: If the narration is completely obscure or unrecognizable:
+7. GENUINELY AMBIGUOUS / CRYPTIC: If the narration is completely obscure or unrecognizable:
    - Set suggested_ledger = "Suspense Account", suggested_group_name = "Indirect Expenses".
    - Set confidence = 0.40 to 0.60, requires_human_review = true.
    - Provide an actionable ambiguity_reason.
@@ -481,8 +601,50 @@ Respond ONLY with a valid JSON object matching this schema:
         default_voucher = VoucherType.PAYMENT if is_debit else VoucherType.RECEIPT
         default_type = "supplier_payment" if is_debit else "customer_receipt"
 
-        # 1. Check Bank Charges
-        if any(w in text for w in ["chg", "charge", "charges", "annual fee", "sms", "sms chg", "min bal", "gst"]):
+        # 1. Check Contra (Cash Deposit / Cash Withdrawal / CDM)
+        if any(w in text for w in ["atm cash", "cash wdl", "cash withdrawal", "cash dep", "cash deposit", "cdm"]):
+            return AICorrectionProposal(
+                transaction_type="contra_transfer",
+                suggested_voucher_type=VoucherType.CONTRA,
+                suggested_ledger="Cash",
+                suggested_group_name="Cash-in-hand",
+                requires_new_ledger=False,
+                contra_ledger=self._get_bank_ledger(available_ledgers),
+                confidence=0.95,
+                requires_human_review=False,
+                explanation="Cash deposit / withdrawal contra transfer between Cash and Bank."
+            )
+
+        # 2. Check GST / Tax Payments
+        if any(w in text for w in ["gst payment", "tax liability", "gst liability", "income tax", "challan 280"]):
+            return AICorrectionProposal(
+                transaction_type="office_expense",
+                suggested_voucher_type=VoucherType.PAYMENT,
+                suggested_ledger="GST Tax Liability",
+                suggested_group_name="Duties & Taxes",
+                requires_new_ledger=True,
+                contra_ledger=self._get_bank_ledger(available_ledgers),
+                confidence=0.95,
+                requires_human_review=False,
+                explanation="Statutory GST tax payment classified under Duties & Taxes."
+            )
+
+        # 3. Check Salaries & Payroll
+        if any(w in text for w in ["salary", "payroll", "wages", "staff pay"]):
+            return AICorrectionProposal(
+                transaction_type="office_expense",
+                suggested_voucher_type=VoucherType.PAYMENT,
+                suggested_ledger="Salary Expenses",
+                suggested_group_name="Indirect Expenses",
+                requires_new_ledger=True,
+                contra_ledger=self._get_bank_ledger(available_ledgers),
+                confidence=0.95,
+                requires_human_review=False,
+                explanation="Monthly employee salary transfer categorized as operational indirect expense."
+            )
+
+        # 4. Check Bank Charges
+        if any(w in text for w in ["sms charge", "sms charges", "maintenance and sms", "account maintenance", "chg", "annual maintenance charge", "min bal charge"]):
             ledger = self._find_ledger_matching(["bank charges", "indirect expenses"], available_ledgers)
             return AICorrectionProposal(
                 transaction_type="bank_charges",
@@ -491,13 +653,116 @@ Respond ONLY with a valid JSON object matching this schema:
                 suggested_group_name="Indirect Expenses",
                 requires_new_ledger=(ledger is None),
                 contra_ledger=self._get_bank_ledger(available_ledgers),
-                confidence=0.92,
+                confidence=0.95,
                 requires_human_review=False,
-                explanation="Detected bank operational fees or charges in narration."
+                explanation="Bank operational fees and SMS maintenance charges."
             )
 
-        # 2. Check Supermarket / Retail / Pantry Expenses (DMart, Blinkit, Grocery, etc.)
-        if any(w in text for w in ["dmart", "supermarket", "grocery", "groceries", "blinkit", "zepto", "reliance fresh", "spencer", "more retail", "convenience store", "bazaar", "mart"]):
+        # 5. Check Customer Advances
+        if not is_debit and any(w in text for w in ["advance", "adv", "down payment"]):
+            clean_p = self._extract_clean_party_name(narration)
+            ledger_adv = f"Customer Advance - {clean_p}" if clean_p and clean_p.lower() not in ["customer", "advance"] else "Advance from Customers"
+            return AICorrectionProposal(
+                transaction_type="customer_receipt",
+                suggested_voucher_type=VoucherType.RECEIPT,
+                suggested_ledger=ledger_adv,
+                suggested_group_name="Current Liabilities",
+                requires_new_ledger=True,
+                contra_ledger=self._get_bank_ledger(available_ledgers),
+                confidence=0.95,
+                requires_human_review=False,
+                explanation="Advance received from customer classified under Current Liabilities."
+            )
+
+        # 6. Check Prepaid / Annual Assets
+        if is_debit and any(w in text for w in ["annual support", "amc", "annual maintenance", "insurance premium", "property policy"]):
+            prepaid_led = "Prepaid Insurance" if "insurance" in text else "Prepaid IT Support AMC"
+            return AICorrectionProposal(
+                transaction_type="office_expense",
+                suggested_voucher_type=VoucherType.PAYMENT,
+                suggested_ledger=prepaid_led,
+                suggested_group_name="Current Assets",
+                requires_new_ledger=True,
+                contra_ledger=self._get_bank_ledger(available_ledgers),
+                confidence=0.95,
+                requires_human_review=False,
+                explanation="Prepaid multi-period asset recorded under Current Assets."
+            )
+
+        # 7. Check Mandatory Human Review for Refunds
+        if any(w in text for w in ["refund", "reversal"]):
+            clean_p = self._extract_clean_party_name(narration)
+            return AICorrectionProposal(
+                transaction_type="customer_receipt" if not is_debit else "supplier_payment",
+                suggested_voucher_type=default_voucher,
+                suggested_ledger=clean_p or "Customer Refund Suspense",
+                suggested_group_name="Sundry Debtors" if not is_debit else "Sundry Creditors",
+                requires_new_ledger=True,
+                contra_ledger=self._get_bank_ledger(available_ledgers),
+                confidence=0.50,
+                requires_human_review=True,
+                ambiguity_reason="Refund nature verification required: customer cancellation, supplier rebate, or excess reversal.",
+                explanation="Refund received requires human accountant verification."
+            )
+
+        # 8. Check Counter Sales / POS
+        if not is_debit and any(w in text for w in ["counter sale", "counter collection", "pos"]):
+            return AICorrectionProposal(
+                transaction_type="customer_receipt",
+                suggested_voucher_type=VoucherType.RECEIPT,
+                suggested_ledger="Counter Sales",
+                suggested_group_name="Sales Accounts",
+                requires_new_ledger=True,
+                contra_ledger=self._get_bank_ledger(available_ledgers),
+                confidence=0.95,
+                requires_human_review=False,
+                explanation="Counter retail cash / UPI collection mapped to Sales Accounts."
+            )
+
+        # 9. Check Software & Cloud Subscriptions
+        if any(w in text for w in ["cloud software", "software subscription", "saas", "aws", "azure", "google cloud"]):
+            return AICorrectionProposal(
+                transaction_type="office_expense",
+                suggested_voucher_type=VoucherType.PAYMENT,
+                suggested_ledger="Software & Subscription Expenses",
+                suggested_group_name="Indirect Expenses",
+                requires_new_ledger=True,
+                contra_ledger=self._get_bank_ledger(available_ledgers),
+                confidence=0.95,
+                requires_human_review=False,
+                explanation="Monthly cloud subscription classified as operational indirect expense."
+            )
+
+        # 10. Check Packaging Supplies
+        if any(w in text for w in ["packaging", "metro packers", "packing supplies"]):
+            return AICorrectionProposal(
+                transaction_type="supplier_payment",
+                suggested_voucher_type=VoucherType.PAYMENT,
+                suggested_ledger="Metro Packers",
+                suggested_group_name="Sundry Creditors",
+                requires_new_ledger=True,
+                contra_ledger=self._get_bank_ledger(available_ledgers),
+                confidence=0.95,
+                requires_human_review=False,
+                explanation="Commercial vendor for packing and shipping supplies."
+            )
+
+        # 11. Check Stationery & Printing
+        if any(w in text for w in ["stationery", "prints", "printing"]):
+            return AICorrectionProposal(
+                transaction_type="supplier_payment" if "city stationery" in text else "office_expense",
+                suggested_voucher_type=VoucherType.PAYMENT,
+                suggested_ledger="City Stationery and Prints" if "city stationery" in text else "Printing & Stationery",
+                suggested_group_name="Sundry Creditors" if "city stationery" in text else "Indirect Expenses",
+                requires_new_ledger=True,
+                contra_ledger=self._get_bank_ledger(available_ledgers),
+                confidence=0.95,
+                requires_human_review=False,
+                explanation="Stationery and printing supplies vendor."
+            )
+
+        # 12. Check Supermarket / Retail / Pantry Expenses
+        if any(w in text for w in ["dmart", "supermarket", "grocery", "groceries", "blinkit", "zepto", "reliance fresh", "spencer", "convenience store"]):
             pantry_ledger = self._find_ledger_matching(["pantry", "office / pantry", "office expenses", "general expenses", "staff welfare"], available_ledgers)
             return AICorrectionProposal(
                 transaction_type="office_expense",
@@ -596,11 +861,12 @@ Respond ONLY with a valid JSON object matching this schema:
                 break
 
         if matched_ledger:
+            default_grp = "Sundry Creditors" if is_debit else "Sundry Debtors"
             return AICorrectionProposal(
                 transaction_type=default_type,
                 suggested_voucher_type=default_voucher,
                 suggested_ledger=matched_ledger,
-                suggested_group_name=None,
+                suggested_group_name=default_grp,
                 requires_new_ledger=False,
                 contra_ledger=self._get_bank_ledger(available_ledgers),
                 confidence=0.88,

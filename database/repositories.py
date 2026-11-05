@@ -112,6 +112,7 @@ class CompanyRepository:
         self.db.commit()
         self.db.refresh(company)
         try:
+            self.get_current_fy(company.id)
             self.seed_company_chart_of_accounts(company.id)
         except Exception as seed_err:
             print(f">> [CompanyRepository] Notice: could not seed default chart of accounts: {seed_err}")
@@ -122,12 +123,15 @@ class CompanyRepository:
         standard_groups = [
             ("Bank Accounts", "GRP-BNK", "ASSET", "DEBIT"),
             ("Cash-in-hand", "GRP-CSH", "ASSET", "DEBIT"),
+            ("Current Assets", "GRP-CAS", "ASSET", "DEBIT"),
+            ("Current Liabilities", "GRP-CLI", "LIABILITY", "CREDIT"),
             ("Sundry Debtors", "GRP-SDR", "ASSET", "DEBIT"),
             ("Sundry Creditors", "GRP-SCR", "LIABILITY", "CREDIT"),
             ("Direct Expenses", "GRP-DIR", "EXPENSE", "DEBIT"),
             ("Indirect Expenses", "GRP-IND", "EXPENSE", "DEBIT"),
             ("Sales Accounts", "GRP-SAL", "INCOME", "CREDIT"),
             ("Purchase Accounts", "GRP-PUR", "EXPENSE", "DEBIT"),
+            ("Indirect Incomes", "GRP-INC", "INCOME", "CREDIT"),
             ("Duties & Taxes", "GRP-TAX", "LIABILITY", "CREDIT"),
             ("Capital Account", "GRP-CAP", "EQUITY", "CREDIT"),
         ]
@@ -188,6 +192,45 @@ class CompanyRepository:
                 is_active=True
             )
             self.db.add(cash_ledger)
+
+        # Standard operational ledgers required for standard business double-entry accounting
+        standard_ledgers = [
+            ("Salary Expenses", "Indirect Expenses", "EXP-SAL"),
+            ("Bank Charges", "Indirect Expenses", "EXP-BNK"),
+            ("Electricity Expenses", "Indirect Expenses", "EXP-ELE"),
+            ("Office Rent", "Indirect Expenses", "EXP-RNT"),
+            ("Telephone & Internet Charges", "Indirect Expenses", "EXP-TEL"),
+            ("Travelling & Conveyance", "Indirect Expenses", "EXP-TRV"),
+            ("Software & Subscription Expenses", "Indirect Expenses", "EXP-SFT"),
+            ("Printing & Stationery", "Indirect Expenses", "EXP-STN"),
+            ("GST Tax Liability", "Duties & Taxes", "TAX-GST"),
+            ("Counter Sales", "Sales Accounts", "SAL-CTR"),
+            ("Advance from Customers", "Current Liabilities", "LIA-ADV"),
+            ("Prepaid Insurance", "Current Assets", "AST-INS"),
+            ("Prepaid IT Support AMC", "Current Assets", "AST-AMC"),
+            ("Suspense Account", "Indirect Expenses", "EXP-SUS"),
+        ]
+
+        for l_name, target_group, l_code in standard_ledgers:
+            if target_group in group_map:
+                existing_ledger = self.db.query(LedgerAccount).filter(
+                    LedgerAccount.company_id == company_id,
+                    LedgerAccount.name == l_name
+                ).first()
+                if not existing_ledger:
+                    new_led = LedgerAccount(
+                        company_id=company_id,
+                        group_id=group_map[target_group].id,
+                        name=l_name,
+                        code=l_code,
+                        opening_balance=Decimal("0.00"),
+                        current_balance=Decimal("0.00"),
+                        is_active=True
+                    )
+                    self.db.add(new_led)
+                elif existing_ledger.group_id != group_map[target_group].id:
+                    # Self-heal ledger group (e.g. if GST Tax Liability was under Sundry Creditors)
+                    existing_ledger.group_id = group_map[target_group].id
 
         self.db.commit()
 
